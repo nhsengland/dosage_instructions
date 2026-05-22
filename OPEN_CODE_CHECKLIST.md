@@ -9,9 +9,9 @@ To ensure that the code we publish is appropraite, clear and reusable we require
 - [x] Is there a README and does it document intended purpose? (**Mandatory**)
 - [x] Is the README clear and concise? (**Optional** - use analytics unit template or [example](https://github.com/othneildrew/Best-README-Template/blob/master/BLANK_README.md))
 - [x] Do you need to consider MHRA 'software as a medical device' guidance? (**Mandatory** - use [flowchart](https://assets.publishing.service.gov.uk/government/uploads/system/uploads/attachment_data/file/999908/Software_flow_chart_Ed_1-08b-IVD.pdf)) - not medical device
-- [ ] Who has responsibility for ongoing support and communications for the code? (**Optional** Best practice to assign, else state the code is not maintained and when the last update was)
+- [x] Who has responsibility for ongoing support and communications for the code? (**Optional** Best practice to assign, else state the code is not maintained and when the last update was) - Digital Meds team - Andy Pritchard will own responsibility for the code.
 - [x] Has a responsible disclosure process for security issues been defined? (**Mandatory** - could use github issues)
-- [n/a] Who will address identified issues and security concerns? (**Mandatory**. - assign monitoring of above disclosure process) - TODO: Andy to own telling us if any issues found
+- [n/a] Who will address identified issues and security concerns? (**Mandatory**. - assign monitoring of above disclosure process) - Andy to own. Will flag to Data Science team if any issues found
 - [n/a] Has semantic versioning been used? (**Optional**) 
 - [n/a] Have [contribution guidelines](https://github.com/alphagov/govuk-frontend/blob/master/CONTRIBUTING.md) or [PR style guides](https://github.com/alphagov/styleguides/blob/master/pull-requests.md) been included? (**Optional**)
 - [x] Are package dependencies and libaries documented with versions? (**Optional**) - meta.yaml
