@@ -1,6 +1,8 @@
+import re
+
 bucket_order = [
     "methodPassive",
-    "methodDirect",  # TODO: make one or the other with methodPassive
+    "methodDirect",
     "doseQuantity",
     "dose_QuantityValueOnly",
     "milligramValue",
@@ -33,37 +35,30 @@ bucket_order = [
     "maxDosePerAdministration",
     "maxDosePerLifetime",
     "extras",  # additionalInstruction
+    "extrasAsDirected",
     "extrasPAUSE",
     "extrasALTER",
     "extras_b",
     "forElement",
 ]
 
-number_dict_options = {
-    "digit_to_word": {
-        "1": "one",
-        "2": "two",
-        "3": "three",
-        "4": "four",
-        "5": "five",
-        "6": "six",
-        "7": "seven",
-        "8": "eight",
-        "9": "nine",
-        "10": "ten",
-    },
-    "word_to_digit": {
-        "one": "1",
-        "two": "2",
-        "three": "3",
-        "four": "4",
-        "five": "5",
-        "six": "6",
-        "seven": "7",
-        "eight": "8",
-        "nine": "9",
-        "ten": "10",
-    },
+# ---------------------------------------------------------------------------
+# WORD_TO_DIGIT — single source of truth for number-word ↔ digit mapping.
+#
+# Used by preprocessing (word→digit) and by exclude_list (nums patterns).
+# To add a new number word, add ONE line here.
+# ---------------------------------------------------------------------------
+WORD_TO_DIGIT = {
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
 }
 
 latin_dict = {
@@ -73,31 +68,31 @@ latin_dict = {
     "acv": "before dinner",
     "bd": ". 2 times every day",
     "od": "every day",
-    "om": "every morning",
     "pc": "after food",
     "pcm": "after breakfast",
     "pcd": "after lunch",
     "pcv": "after dinner",
     "prn": ". when required",
-    "qds": ". to be taken 4 times every day",
+    "qds": ". 4 times every day",
     "qqh": "every 4 hours",
     "stat": "immediately",
-    "tds": ". to be taken 3 times every day",
+    "tds": ". 3 times every day",
     "tid": ". 3 times every day",
-    "mane": "every morning",
-    "nocte": "every night",
+    "mane": "in the morning",
+    "nocte": "at night",
     "hs": "before sleep",
     "wake": "upon waking",
     "c": "at a meal",
     "cm": "at breakfast",
     "cv": "at dinner",
-    "morn": "morning",
-    "aft": "afternoon",
-    "eve": "evening",
     "phs": "after sleep",
     "mdu": "as directed",
+    # Note: GPs uneasy about this conversion: "morn": "morning",
+    # Note: GPs uneasy about this conversion: "aft": "afternoon",
+    # Note: GPs uneasy about this conversion: "eve": "evening",
     # Note: can't include "on": "every night", because of alternate meaning (e.g. on Friday)
     # Note: can't include "cd": "at lunch", because of possible mix up with control drug
+    # Note: can't include "om": "every morning", because of risk (e.g. does 8om refer to time)
 }
 
 replace_isolated_terms = {
@@ -113,31 +108,186 @@ replace_isolated_terms = {
     r"hr": "hour",
     r"(\d+)\s+(and)\sa?\s?(half)\s?(of)?\s?a?": r"$1.5 ",
     r"(\d+)\s+(and)\sa\s(half)": "$1.5 ",
+    r"(half)\s+of\s+1": "0.5 ",  # "half of 1 tablet" → "0.5 tablet" (consume the "1")
     r"(half)\s?(of)?\s?a?": "0.5 ",
     r"(\d+)\s+and 3 quarters of a": "$1.75 ",
     r"(\d+)\s+(and)\s(3 quarters)\s?(of)?\s?a?": "$1.75 ",
+    r"(3 quarters)\s+of\s+1": "0.75 ",  # "3 quarters of 1 tablet" → "0.75 tablet"
     r"(3 quarters)\s?(of)?\s?a?": "0.75 ",
     r"(\d+)\s+(and)\sa?\s?(quarter)\s?(of)?\s?a?": "$1.25 ",
-    r"a?(quarter)\s?(of)?\s?a?": "0.25 ",
+    r"(quarter)\s+of\s+1": "0.25 ",  # "quarter of 1 tablet" → "0.25 tablet"
+    r"a?\s+(quarter)\s?(of)?\s?a?": "0.25 ",
     "upto": "up to",
 }
 
-replace_partofaword_terms = {
-    # r"\(s\)": "s ", # Dont remove (s) as a different meaning
-    r"(\d{1,2})[\/](\d{1,2})[\/](\d{2,4})": r"$1.$2.$3",
-    r"(\d{1,2})[\-](\d{1,2})[\-](\d{2,4})": r"$1.$2.$3",
+# ---------------------------------------------------------------------------
+# Date separator normalisation — see docs/preprocessing_dates.md
+#
+# spaCy's tokenizer splits on "/" and "-" but keeps "." inside tokens:
+#   "01/01/2025" → ["01", "/", "01", "/", "2025"]  (5 tokens — breaks matcher)
+#   "01-01-2025" → ["01", "-", "01", "-", "2025"]  (5 tokens — breaks matcher)
+#   "01.01.2025" → ["01.01.2025"]                   (1 token  — works)
+#
+# By converting slash- and dash-separated dates to dot-separated BEFORE
+# tokenisation, the date matchers (date_reg_dmy, date_reg_ymd) only need
+# to match a single token. The date regexes still accept all three separators
+# so they also match any mixed-separator dates that slip through (though in
+# practice those won't tokenise as a single token and therefore won't match).
+# ---------------------------------------------------------------------------
+normalise_date_separators = {
+    r"(\d{1,2})[\/](\d{1,2})[\/](\d{2,4})": r"$1.$2.$3",  # dd/mm/yyyy → dd.mm.yyyy
+    r"(\d{1,2})[\-](\d{1,2})[\-](\d{2,4})": r"$1.$2.$3",  # dd-mm-yyyy → dd.mm.yyyy
 }
 
-weird_terms = {
+# Ensure number-dash-number ranges have spaces around the dash so they are
+# not confused with hyphenated compounds (e.g. "2-4" → "2 - 4").
+normalise_number_ranges = {
     r"(\d+)\s-(\d+)": r"$1 - $2",
 }
 
-clean_up_stragglers = {
-    r"\(\)": "",
-    r"\.": "",
+# ---------------------------------------------------------------------------
+# DOSE_FORMS — single source of truth for dose-form unit metadata.
+#
+# Each entry maps a singular form to (plural, snomed_code, snomed_display, is_unit_dose).
+#   plural:         plural form
+#   snomed_code:    SNOMED CT code for FHIR coding (or None for display-only)
+#   snomed_display: SNOMED display text (or None)
+#   is_unit_dose:   True if >10 of this form is implausible (used by rule VC2)
+#
+# To add a new dose form, add ONE line here.
+# ---------------------------------------------------------------------------
+DOSE_FORMS = {
+    # singular          plural               snomed_code          snomed_display   is_unit_dose
+    "tablet": ("tablets", "428673006", "Tablet", True),
+    "capsule": ("capsules", "428641000", "Capsule", True),
+    "puff": ("puffs", "415215001", "Puff", True),
+    "drop": ("drops", "404218003", "Drop", False),
+    "patch": ("patches", "421134003", "Patch", True),
+    "sachet": ("sachets", "733010000", "Sachet", True),
+    "dose": ("doses", "3317411000001100", "Dose", False),
+    "lozenge": ("lozenges", "385087003", "Lozenge", True),
+    "pessary": ("pessaries", "421079001", "Pessary", True),
+    "suppository": ("suppositories", "385194003", "Suppository", True),
+    "injection": ("injections", "129326001", "Injection", True),
+    "vial": ("vials", "415818005", "Vial", True),
+    "ampoule": ("ampoules", "413516001", "Ampoule", True),
+    "pump": ("pumps", "2741000175105", "Pump", False),
+    "enema": ("enemas", "385166005", "Enema", True),
+    "spoonful": ("spoonfuls", "733015005", "Spoonful", False),
+    "spray": ("sprays", "738996007", "Spray", False),
+    "suck": ("sucks", "764498003", "Suck", False),
+    "application": ("applications", "413568008", "Application", False),
+    # No SNOMED code — display only
+    "spoon": ("spoons", None, None, False),
+    "bottle": ("bottles", None, None, False),
+    "strip": ("strips", None, None, False),
+    "caplet": ("caplets", None, None, False),
+    "dressing": ("dressings", None, None, False),
+    "swab": ("swabs", None, None, False),
+    "plaster": ("plasters", None, None, False),
+    "applicator": ("applicators", None, None, False),
+    "cup": ("cups", None, None, False),
+    "scoop": ("scoops", None, None, False),
+    "pastille": ("pastilles", None, None, False),
+    "chewable tablet": ("chewable tablets", None, None, False),
 }
 
-nums = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
+# ---------------------------------------------------------------------------
+# Derived from DOSE_FORMS
+# ---------------------------------------------------------------------------
+DOSE_FORM_TO_SNOMED = {}
+for _sg, (_pl, _code, _display, _) in DOSE_FORMS.items():
+    if _code is None:
+        continue  # no SNOMED code — falls through to display-only in fhir_logic
+    _entry = {"code": _code, "display": _display}
+    DOSE_FORM_TO_SNOMED[_sg] = _entry
+    if _pl:
+        DOSE_FORM_TO_SNOMED[_pl] = _entry
+    DOSE_FORM_TO_SNOMED[f"{_sg}(s)"] = _entry
+
+UNIT_DOSE_FORMS = frozenset(
+    sg for sg, (pl, _, _, is_ud) in DOSE_FORMS.items() if is_ud
+) | frozenset(pl for _, (pl, _, _, is_ud) in DOSE_FORMS.items() if is_ud and pl)
+
+SINGULAR_TO_PLURAL = {sg: pl for sg, (pl, _, _, _) in DOSE_FORMS.items() if pl}
+PLURAL_TO_SINGULAR = {v: k for k, v in SINGULAR_TO_PLURAL.items()}
+ALL_SINGULAR = frozenset(SINGULAR_TO_PLURAL.keys())
+ALL_PLURAL = frozenset(SINGULAR_TO_PLURAL.values())
+
+# ---------------------------------------------------------------------------
+# unit_config — derived from DOSE_FORMS for matcher pattern generation.
+# ---------------------------------------------------------------------------
+unit_config = {
+    "options": list(DOSE_FORMS.keys()),
+    "prefixes": [""],
+    "suffixes": ["", "s", "(s)", "es"],
+}
+
+# Build alternation of dose-form words for use in exclude_list pattern.
+# Sorted longest-first so regex matches greedily (e.g. "chewable tablets" before "tablets").
+_DOSE_FORM_ALTERNATION = "|".join(
+    sorted(
+        {opt + s for opt in unit_config["options"] for s in ("", "s")},
+        key=len,
+        reverse=True,
+    )
+)
+
+# ---------------------------------------------------------------------------
+# PERIOD_UNITS — single source of truth for all period/time unit metadata.
+#
+# Each entry maps a base unit name to (ucum_code, days, adverb).
+# Everything else (period_unit_config, _PERIOD_UNIT_ADVERBS, FHIR UCUM
+# lookups, cross-column day conversions) is derived from this dict.
+# To add a new period unit, add ONE line here.
+# ---------------------------------------------------------------------------
+PERIOD_UNITS = {
+    #  base_form    ucum   days        adverb           plural
+    "minute": ("min", 1 / 1440, "minutely", "minutes"),
+    "hour": ("h", 1 / 24, "hourly", "hours"),
+    "day": ("d", 1, "daily", "days"),
+    "week": ("wk", 7, "weekly", "weeks"),
+    "fortnight": (
+        "wk",
+        14,
+        "fortnightly",
+        "fortnights",
+    ),  # UCUM has no fortnight; use 2×wk
+    "month": ("mo", 30, "monthly", "months"),
+    "year": ("a", 365, "yearly", "years"),
+    "annual": ("a", 365, None, None),  # alias for year, no adverb/plural
+}
+
+# ---------------------------------------------------------------------------
+# Ambiguous "<number> <unit>ly" patterns (e.g. "4 hourly", "4-6 hourly")
+# These are ambiguous because "4 hourly" could mean either:
+#   - 4 (quantity) every hour, OR
+#   - every 4 hours
+# We exclude any instruction containing <digit><space or hyphen><period-adverb>.
+# ---------------------------------------------------------------------------
+_PERIOD_UNIT_ADVERBS = {k: v[2] for k, v in PERIOD_UNITS.items() if v[2]}
+_PERIOD_UNIT_PLURALS = {k: v[3] for k, v in PERIOD_UNITS.items() if v[3]}
+_PERIOD_ADVERBS_PATTERN = "|".join(_PERIOD_UNIT_ADVERBS.values())
+
+# ── Derived lookups (used by fhir_logic and cross_column_validity_rules) ──
+PERIOD_UNIT_TO_UCUM = {}
+for _pu, (_ucum, _, _, _plural) in PERIOD_UNITS.items():
+    PERIOD_UNIT_TO_UCUM[_pu] = _ucum
+    if _plural:
+        PERIOD_UNIT_TO_UCUM[_plural] = _ucum
+
+PERIOD_UNIT_TO_DAYS = {}
+for _pu, (_, _days, _, _plural) in PERIOD_UNITS.items():
+    if _pu == "annual":
+        continue  # cross-column rules use base period words only
+    PERIOD_UNIT_TO_DAYS[_pu] = _days
+    if _plural:
+        PERIOD_UNIT_TO_DAYS[_plural] = _days
+
+# Derived from WORD_TO_DIGIT — used by exclude_list patterns
+nums = list(WORD_TO_DIGIT.keys())
+_NUMS_PATTERN = "|".join(nums)
+_NUMS_PATTERN_GT1 = "|".join(nums[1:])  # two|three|...|ten (excludes "one")
 exclude_list = [a + b for a in nums for b in nums] + [
     "one half",
     "1 half",
@@ -149,26 +299,68 @@ exclude_list = [a + b for a in nums for b in nums] + [
     "&lt;",
     "1 time",
     "one time",
+    r"\d\s?\.\s\d",
+    r"\d\s\.\d",
+    # ── Ambiguous fraction-number patterns ────────────────────────────────────
+    # "half - one tablet" / "half one tablet" — unclear if range or fixed dose
+    rf"\bhalf\s*-\s*({_NUMS_PATTERN}|\d+)\b",
+    rf"\bhalf\s+({_NUMS_PATTERN}|\d+)\b",
+    rf"\bquarter\s*-\s*({_NUMS_PATTERN}|\d+)\b",
+    rf"\bquarter\s+({_NUMS_PATTERN}|\d+)\b",
+    rf"\b3 quarters\s*-\s*({_NUMS_PATTERN}|\d+)\b",
+    rf"\b3 quarters\s+({_NUMS_PATTERN}|\d+)\b",
+    # "half of 2 tablets" — ambiguous arithmetic (half of N>1)
+    # Excludes "one"/1 because "half of one tablet" is unambiguous (= 0.5 tablet)
+    # and preprocessing already converts it via "half of 1" → "0.5 ".
+    rf"\bhalf of ({_NUMS_PATTERN_GT1}|\d{{2,}}|[2-9])\b",
+    rf"\bquarter of ({_NUMS_PATTERN_GT1}|\d{{2,}}|[2-9])\b",
+    rf"\b3 quarters of ({_NUMS_PATTERN_GT1}|\d{{2,}}|[2-9])\b",
+    # ── Ambiguous "<number> <period-adverb>" patterns ─────────────────────────
+    # "4 hourly" / "4-6 hourly" / "4-hourly" — could mean "every 4 hours" or
+    # "4 (quantity) every hour". Exclude rather than guess.
+    # "1 hourly" / "one hourly" is unambiguous (= once every hour) so only >1 excluded.
+    # Digits: 2-9 or 2+ digit numbers (10, 12, etc.) — not "1" alone
+    rf"(?:[2-9]|\d{{2,}})[\s-](?:{_PERIOD_ADVERBS_PATTERN})",
+    # Written numbers (two–ten) — word-to-digit hasn't run yet at exclude time
+    rf"\b(?:{_NUMS_PATTERN_GT1})[\s-](?:{_PERIOD_ADVERBS_PATTERN})",
+    # ── Number glued to dose-form word (no space) ─────────────────────────────
+    # "2tablets" is a typo/OCR error — ambiguous whether "2 tablets" or garbage.
+    # NOT excluded when followed by "/" (e.g. "2tablets/day" is a valid rate).
+    rf"\d+(?:{_DOSE_FORM_ALTERNATION})\b(?!/)",
+    # ── Two bare numbers separated only by whitespace ─────────────────────────
+    # e.g. "1 3 times a day", "2  4 times daily", "1\t2 tablets"
+    # A number immediately followed by another number (spaces/tabs only between)
+    # is always a data error — valid instructions always have a word or operator
+    # (to, or, x, -, /, in, every …) between two numbers.
+    r"\b\d+[ \t]+\d+\b",
 ]
 
+# ---------------------------------------------------------------------------
+# Date token regexes — match a SINGLE token containing a complete date.
+#
+# These work because preprocessing normalises "/" and "-" separators to "."
+# (see normalise_date_separators above and docs/preprocessing_dates.md).
+# spaCy keeps "." inside tokens, so "01.01.2025" arrives as one token.
+# The [\/.\-] character class is retained as a safety fallback.
+# ---------------------------------------------------------------------------
 date_reg_dmy = (
-    r"^([0-2]?[1-9]|10|20|30|31)"  # day dd. 01-09 or 1-24
-    r"([\/.\-](0?[0-9]|10|11|12)[\/.\-]"  # either month, 01-09 or 1-12
-    r"|[\/.\-\s]"  # or add space option and mmm or Month
+    r"^([0-2]?[1-9]|10|20|30|31)"  # day: 01-31
+    r"([\/.\-](0?[0-9]|10|11|12)[\/.\-]"  # numeric month: 01-12
+    r"|[\/.\-\s]"  # or separator before named month
     r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|"
     r"January|February|March|April|May|June|July|August|September|October|November|December)"
     r"[\/.\-\s])"
-    r"(19|20)[0-9]{2}$"  # year yyyy. 1900-2099
+    r"(19|20)[0-9]{2}$"  # year: 1900-2099
 )
 
 date_reg_ymd = (
-    r"^(19|20)[0-9]{2}"  # year yyyy. 1900-2099
-    r"([\/.\-](0?[0-9]|10|11|12)[\/.\-]"  # either month, 01-09 or 1-12h
-    r"|[\/.\-\s]"  # or add space option and mmm or Month
+    r"^(19|20)[0-9]{2}"  # year: 1900-2099
+    r"([\/.\-](0?[0-9]|10|11|12)[\/.\-]"  # numeric month: 01-12
+    r"|[\/.\-\s]"  # or separator before named month
     r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|"
     r"January|February|March|April|May|June|July|August|September|October|November|December)"
     r"[\/.\-\s])"
-    r"([0-2]?[1-9]|10|20|30|31)$"  # day dd. 01-09 or 1-24
+    r"([0-2]?[1-9]|10|20|30|31)$"  # day: 01-31
 )
 
 #  Add the plural of the list via processing rather than require both in the list. Display as 5 milligram
@@ -192,148 +384,136 @@ preprocess_units_of_measure = {
     ],  #
 }
 
-odd_spellings = {
-    "daily": "dayly",
-    " ": "  ",
+
+# ---------------------------------------------------------------------------
+# ROUTES — single source of truth for administration route metadata.
+#
+# Each entry maps a route name to (snomed_code, snomed_display, adverbial).
+#   snomed_code:    SNOMED CT code for FHIR coding (or None)
+#   snomed_display: SNOMED display text (or None)
+#   adverbial:      adverb form matched in text (e.g. "orally") or None
+#
+# To add a new route, add ONE line here.
+# ---------------------------------------------------------------------------
+ROUTES = {
+    # route_name                              snomed_code           snomed_display                adverbial
+    # ── With SNOMED code ──────────────────────────────────────────────────────
+    "oral": ("26643006", "Oral", "orally"),
+    "inhalation": ("18679011000001101", "Inhalation", None),
+    "subcutaneous": ("34206005", "Subcutaneous", "subcutaneously"),
+    "intravenous": ("47625008", "Intravenous", "intravenously"),
+    "intramuscular": ("78421000", "Intramuscular", "intramuscularly"),
+    "rectal": ("37161004", "Rectal", None),
+    "vaginal": ("16857009", "Vaginal", "vaginally"),
+    "nasal": ("46713006", "Nasal", "nasally"),
+    "sublingual": ("37839007", "Sublingual", None),
+    "transdermal": ("45890007", "Transdermal", None),
+    "topical": ("6064005", "Topical", "topically"),
+    "buccal": ("54471007", "Buccal", None),
+    "epidural": ("404820008", "Epidural", None),
+    "intrathecal": ("72607000", "Intrathecal", None),
+    "intra-articular": ("12130007", "Intra-articular", None),
+    "intra-arterial": ("58100008", "Intra-arterial", None),
+    "intradermal": ("372464004", "Intradermal", None),
+    "intravitreal": ("58831000052108", "Intravitreal", None),
+    "periarticular": ("372464004", "Periarticular", None),
+    "ocular": ("54485002", "Ophthalmic", None),
+    "otic": ("10547007", "Otic", None),
+    "cutaneous": ("6064005", "Cutaneous", None),
+    "percutaneous": ("6064005", "Percutaneous", None),
+    "enteral": ("447694001", "Enteral", None),
+    "gastroenteral": ("447694001", "Gastroenteral", None),
+    "gastrostomy": ("127490009", "Gastrostomy", None),
+    "jejunostomy": ("127491008", "Jejunostomy", None),
+    "nasogastric": ("127492001", "Nasogastric", None),
+    "nasojejunal": ("446540005", "Nasojejunal", None),
+    "oromucosal": ("447052000", "Oromucosal", None),
+    "translingual": ("37839007", "Translingual", None),
+    "implantation": ("90028008", "Implantation", None),
+    "intraperitoneal": ("38239002", "Intraperitoneal", None),
+    "intravesical": ("372468001", "Intravesical", None),
+    "intralesional": ("372469009", "Intralesional", None),
+    "intraosseous": ("417255000", "Intraosseous", None),
+    "intracardiac": ("372460005", "Intracardiac", None),
+    "intrapleural": ("418821007", "Intrapleural", None),
+    "intracameral": ("418401004", "Intracameral", None),
+    "dental": ("372449004", "Dental", None),
+    "endocervical": ("37737002", "Endocervical", None),
+    "gingival": ("372457001", "Gingival", None),
+    "infiltration": ("446540005", "Infiltration", None),
+    "urethral": ("90028008", "Urethral", None),
+    "subconjunctival": ("37161004", "Subconjunctival", None),
+    "pericardial": ("445771006", "Pericardial", None),
+    "haemodialysis": ("431784008", "Haemodialysis", None),
+    "haemofiltration": ("431784008", "Haemofiltration", None),
+    "haemodiafiltration": ("431784008", "Haemodiafiltration", None),
+    # ── No SNOMED code (display only) ─────────────────────────────────────────
+    "submucosal rectal": (None, None, None),
+    "subretinal": (None, None, None),
+    "intrauterine": (None, None, None),
+    "perilesional": (None, None, None),
+    "intracavernous": (None, None, None),
+    "intracervical": (None, None, None),
+    "intracoronary": (None, None, None),
+    "intradiscal": (None, None, None),
+    "intralymphatic": (None, None, None),
+    "intraocular": (None, None, None),
+    "intrasternal": (None, None, None),
+    "perineural": (None, None, None),
+    "extra-amniotic": (None, None, None),
+    "endosinusial": (None, None, None),
+    "endotracheopulmonary": (None, None, None),
+    "intraamniotic": (None, None, None),
+    "intrabursal": (None, None, None),
+    "transmucosal": (None, None, None),
+    "intraglandular": (None, None, None),
+    "intracerebroventricular": (None, None, None),
+    "intraventricular route - cardiac": (None, None, None),
+    "body cavity": (None, None, None),
+    "regional perfusion": (None, None, None),
+    "peribulbar ocular": (None, None, None),
+    "extracorporeal": (None, None, None),
+    "intraputaminal": (None, None, None),
+    "sublabial": (None, None, None),
+    "retrobulbar": (None, None, None),
+    "intratendinous": (None, None, None),
+    "intratumor": (None, None, None),
+    "epilesional": (None, None, None),
+    "percutaneous endoscopic gastrostomy tube": (None, None, None),
+    "intraepidermal": (None, None, None),
+    "iontophoresis": (None, None, None),
+    "peritendinous": (None, None, None),
+    "submucosal": (None, None, None),
+    "intracatheter instillation": (None, None, None),
+    "intradialytic": (None, None, None),
+    "intracholangiopancreatic": (None, None, None),
+    "line lock": (None, None, None),
+    "periosseous": (None, None, None),
+    "peritumoral": (None, None, None),
 }
 
-site_old_config = {
-    "options": [
-        "nostril",
-        "rectum",
-        "eye",
-        "tongue",
-        "area",
-        "nail",
-    ],
-    "prefixes": ["in the", "to the", "in", "to", "into", "under", "on", ""],
-    "next_prefixes": [
-        "both",
-        "affected",
-        "each",
-        "the",
-        "painful",
-        "left",
-        "right",
-        "infected",  # new
-        "",
-    ],
-    "suffixes": ["s", "(s)", ""],
-}
+# ---------------------------------------------------------------------------
+# Derived from ROUTES
+# ---------------------------------------------------------------------------
+route = list(ROUTES.keys())
 
-asNeededBoolean = [
-    "as required",
-    "when required",
-    "if required",
-    # "as req",  # removed as could mean requested
-    # "when req",  # removed as could mean requested
-    # "if req",  # removed as could mean requested
-    "as needed",
-    "if needed",
-    "when needed",
-    "as necessary",
-    "if necessary",
-    "when necessary",
-]
+ROUTE_TO_SNOMED = {}
+for _r, (_code, _display, _) in ROUTES.items():
+    if _code is not None:
+        ROUTE_TO_SNOMED[_r] = {"code": _code, "display": _display}
 
-# route - mostly secondary care
-route = [
-    "submucosal rectal",
-    "inhalation",
-    "implantation",
-    "buccal",
-    "intraperitoneal",
-    "subretinal",
-    "intrauterine",
-    "perilesional",
-    "intracavernous",
-    "intracervical",
-    "intracoronary",
-    "intradermal",
-    "intracardiac",
-    "intralesional",
-    "intradiscal",
-    "intrapleural",
-    "intralymphatic",
-    "intraocular",
-    "intrasternal",
-    "perineural",
-    "subconjunctival",
-    "oromucosal",
-    "intravesical",
-    "periarticular",
-    "ocular",
-    "dental",
-    "endocervical",
-    "extra-amniotic",
-    "gastroenteral",
-    "endosinusial",
-    "endotracheopulmonary",
-    "intraamniotic",
-    "intrabursal",
-    "gingival",
-    "intra-articular",
-    "transmucosal",
-    "epidural",
-    "intraglandular",
-    "intracerebroventricular",
-    "intraosseous",
-    "infiltration",
-    "intraventricular route - cardiac",
-    "body cavity",
-    "regional perfusion",
-    "nasal",
-    "peribulbar ocular",
-    "extracorporeal",
-    "intravenous",
-    "oral",
-    "subcutaneous",
-    "intraputaminal",
-    "enteral",
-    "intracameral",
-    "sublabial",
-    "nasojejunal",
-    "intravitreal",
-    "retrobulbar",
-    "intratendinous",
-    "intratumor",
-    "epilesional",
-    "percutaneous endoscopic gastrostomy tube",
-    "intraepidermal",
-    "pericardial",
-    "intrathecal",
-    "haemodialysis",
-    "intramuscular",
-    "iontophoresis",
-    "haemodiafiltration",
-    "translingual",
-    "cutaneous",
-    "peritendinous",
-    "percutaneous",
-    "submucosal",
-    "otic",
-    "haemofiltration",
-    "intracatheter instillation",
-    "intradialytic",
-    "intracholangiopancreatic",
-    "sublingual",
-    "transdermal",
-    "line lock",
-    "periosseous",
-    "gastrostomy",
-    "jejunostomy",
-    "nasogastric",
-    "rectal",
-    "peritumoral",
-    "urethral",
-    "vaginal",
-    "intra-arterial",
-]
+route_adverbial_mapping = {k: adv for k, (_, _, adv) in ROUTES.items() if adv}
+
+MEDICAL_PROFESSIONAL = (
+    r"(?:specialist|hospital|consultant|dietician|dermatology|cardiology)"
+)
+COMMON_MEDICINE = r"(paracetamol|ibuprofen|asprin|naproxen|prednisolone)"
 extras_asDirected = [
-    # fixed
-    "as directed",  # Additional information
-    r"\basd\b",
-    r"\bad\b",
+    # Longer "by professional" patterns FIRST so they win over the shorter ones.
+    # These stay as text-only additionalInstruction (no SNOMED code).
+    r"\bas directed by " + MEDICAL_PROFESSIONAL,
+    # Generic forms — normalised to "as directed" → gets SNOMED 1116431000001106
+    r"\bas directed\b",
 ]
 extras_symptoms_PAUSE = [
     "these tablets are addictive so do not take regularly",
@@ -348,15 +528,39 @@ extras_purpose = [
 ]  # Qcall2 - What does Friday Collect mean?
 extras_how = [
     "sparingly",
+    "gently",
+    "liberally",
+    "vigorously",
+    "slowly",
+    "repeatedly",
+    "completely",
+    "deeply",
+    "thoroughly",
+    "once only, at night",
+    "once only",
+    "only",
+    "until finished",
+    "until gone",
+    "then discontinue",
+    "now",
     "preferably",
     "thinly",
     "as moisturiser and as soap substitute",
     "to be supplied in a dosette",
     "in dosette",
     "via spacer",
+    "via peg",
     "as soap substitute",
     "at the same time every day",
-    "without a break",  # Qcall2
+    "without a break",
+    "do not stop",
+    "then stop",
+    "for life",
+    "life long",
+    "lifelong",
+    "lifelong treatment",
+    "to continue lifelong",
+    "avoid grapefruit",
     r"with your inhaler(\(s\)|s)?",
     r"with (plenty of )?(water|orange juice)",
     "with a full glass of water",
@@ -366,13 +570,14 @@ extras_how = [
     (
         r"(with|while|whilst|when)? ?"
         r"(taking|on|using)? ?"
-        r"(regular)? ?"
-        r"(paracetamol|ibuprofen|asprin|naproxen|prednisolone)"
+        r"(regular)? ?" + COMMON_MEDICINE
     ),  # Qcall2
     "while sitting",
     "while standing",
     "while sitting or standing",
     "when washing hair",
+    r"as advised by " + MEDICAL_PROFESSIONAL,
+    r"as per " + MEDICAL_PROFESSIONAL,
 ]
 extras_how_PAUSE = [
     "rinse mouth with water and spit out after use",
@@ -402,9 +607,7 @@ extra_random_PAUSE = [
     "indication: cvd prevention",
 ]
 
-extras = (
-    extras_asDirected + extras_purpose + extras_how + extra_random + extras_qualifiers
-)
+extras = extras_purpose + extras_how + extra_random + extras_qualifiers
 
 # These don't sound right unless a comma is added prior
 extrasPAUSE = (
@@ -424,57 +627,35 @@ extras_b = [
     "amber 3",
 ]
 
-unit_config = {
-    "options": [
-        "tablet",
-        "chewable tablet",
-        "capsule",
-        "dose",
-        "puff",
-        "drop",
-        # "tab",  # removed as ambiguous
-        "spoon",
-        "spoonful",
-        # "cap",  # removed as ambiguous
-        "ampoule",
-        "patch",
-        "sachet",
-        "pump",
-        "caplet",
-        # "spray",  # could be method or unit
-        # "doses",  # new
-        # "spoonfuls",  # new
-        # "sprays",  # new
-        "bottle",  # new
-        "enema",
-        "lozenge",
-        "pastille",
-        "pessary",
-        "strip",
-        "suppository",
-        "vial",
-        "dressing",
-        "swab",
-        "plaster",
-        "applicator",
-        "cup",
-        "scoop",
-        "injection",
-    ],
-    "prefixes": [""],
-    "suffixes": ["", "s", "(s)", "es"],
-}
+# ---------------------------------------------------------------------------
+# Parenthetical (s) — words that may appear as "word(s)" in prescriptions.
+# Registered as single tokens with NORM = singular so spaCy doesn't split them.
+# Sites (eye, nostril, area, nail) are intentionally EXCLUDED — "eye(s)" carries
+# clinical meaning (one or both eyes).
+#
+# Derived from DOSE_FORMS (dose units) + PERIOD_UNITS (time units) + "time".
+# Multi-word options (e.g. "chewable tablet") are excluded — spaCy can't
+# register multi-word special cases for "(s)" tokenisation.
+# ---------------------------------------------------------------------------
+PARENTHETICAL_S_WORDS = sorted(
+    {sg for sg in DOSE_FORMS if " " not in sg}
+    | {k for k in PERIOD_UNITS if k != "annual"}
+    | {"time"}
+)
+
+# ── Derived (s) resolution lookups (used by matcher_classes) ─────────────────
+PARENTHETICAL_S_SINGULAR = {f"{w}(s)": w for w in PARENTHETICAL_S_WORDS}
+PARENTHETICAL_S_PLURAL = {}
+for _sg, (_pl, _, _, _) in DOSE_FORMS.items():
+    if _pl and " " not in _sg:
+        PARENTHETICAL_S_PLURAL[f"{_sg}(s)"] = _pl
+for _pu, (_, _, _, _plural) in PERIOD_UNITS.items():
+    if _plural:
+        PARENTHETICAL_S_PLURAL[f"{_pu}(s)"] = _plural
+PARENTHETICAL_S_PLURAL["time(s)"] = "times"
+
 period_unit_config = {
-    "options": [
-        "minute",
-        "hour",
-        "day",
-        "week",
-        "fortnight",
-        "month",
-        "annual",
-        "year",  # Qcall2 add cycle?
-    ],
+    "options": list(PERIOD_UNITS.keys()),
     "prefixes": [
         "per",
         "a",
@@ -494,94 +675,89 @@ special_unit_config = {
     "suffixes": [""],
 }
 
-method_config = {
-    "options": [
-        "take",
-        "inhale",
-        "apply",
-        "use",
-        "insert",
-        # "spray",  # mixes up with spray the unit
-        "place",
-        "chew",
-        "instil",
-        "infuse",
-        "dissolve",
-        "inject",
-        # "suck",
-        "massage",
-        "swallow",
-        "administer",
-        "rinse",
-        "gargle",
-        "give",
-    ],
-    "past_participles": [
-        "taken",
-        "inhaled",
-        "applied",
-        "used",
-        "inserted",
-        "placed",
-        "chewed",
+# ---------------------------------------------------------------------------
+# METHODS — single source of truth for method/verb metadata.
+#
+# Each entry maps a verb to (past_participle, snomed_code, snomed_display).
+#   past_participle: the passive form matched by MethodPassiveElement
+#   snomed_code:     SNOMED CT code for FHIR coding (or None)
+#   snomed_display:  SNOMED display text (or None)
+#
+# spaCy lemmatises past participles to base form, so "instilled" → "instill"
+# (American/SNOMED spelling). The British "instil" is the dict key; the lemma
+# "instill" is added to METHOD_TO_SNOMED automatically for lookup.
+#
+# To add a new method verb, add ONE line here.
+# ---------------------------------------------------------------------------
+METHODS = {
+    # verb           past_participle  snomed_code        snomed_display
+    "take": ("taken", "419652001", "Take"),
+    "inhale": ("inhaled", "740666001", "Inhale"),
+    "apply": ("applied", "738991002", "Apply"),
+    "use": ("used", "18629005", "Use"),
+    "insert": ("inserted", "738993004", "Insert"),
+    "spray": ("sprayed", "738996007", "Spray"),
+    "suck": ("sucked", "764498003", "Suck"),
+    "place": ("placed", "421066005", "Place"),
+    "chew": ("chewed", "738992009", "Chew"),
+    "instil": (
         "instilled",
-        "infused",
-        "dissolved",
-        "injected",
-        # "sucked",
-        "massaged",
-        "swallowed",
-        "administered",
-        "rinsed",
-        "gargled",
+        "738994005",
+        "Instill",
+    ),  # British verb; SNOMED uses American "Instill"
+    "infuse": ("infused", "764794000", "Infuse"),
+    "dissolve": ("dissolved", "421521009", "Dissolve"),
+    "inject": ("injected", "740685003", "Inject"),
+    "massage": ("massaged", "448598008", "Massage"),
+    "swallow": ("swallowed", "738995006", "Swallow"),
+    "administer": ("administered", "738990001", "Administer"),
+    "rinse": ("rinsed", "782155003", "Rinse"),
+    "gargle": ("gargled", "782168006", "Gargle"),
+    "give": (
         "given",
-    ],
-    "prefixes": ["", "to be "],
-    "suffixes": ["", "n", "d", "ed"],
+        None,
+        None,
+    ),  # SNOMED display is "Administer" — doesn't match input text
+    "dilute": ("diluted", "421399004", "Dilute"),
+    "sprinkle": ("sprinkled", "422219000", "Sprinkle"),
+    "shampoo": ("shampooed", "420606003", "Shampoo"),
+    "sniff": ("sniffed", "420360002", "Sniff"),
+    "wash": ("washed", "422152000", "Wash"),
+    "swish": ("swished", "421805007", "Swish"),
 }
 
-# note - don't add pain, or anxiety to options. if so then only to extract for asNeededCodeable
-when_old_config = {
-    "options": [
-        "empty stomach",
-        "bowel movement",
-        "lunchtime",
-        "evening meal",
-        "main meal",
-        "morning",
-        "noon",
-        "afternoon",
-        "evening",
-        "night",
-        "food",
-        "meal",
-        "breakfast",
-        "lunch",
-        "dinner",
-        "tea time",
-        "asleep",
-        "sleep",
-        "bedtime",
-        "waking",
-        "wake",
-        "eat",
-        "procedure",
-    ],
-    "prefixes": [
-        "after",
-        "before",
-        "with",
-        "on",
-        "at",
-        "once",
-        "upon",
-        "when",
-        "each",
-        "every",
-        "in",
-        "",
-    ],
-    "suffixes": [""],
+# Compound methods — multi-token phrases matched as a single method unit.
+# Each maps a phrase to (snomed_code, snomed_display).
+COMPOUND_METHODS = {
+    "swish and swallow": ("421298005", "Swish and swallow"),
+    "apply sparingly": ("93431000001109", "Apply sparingly"),
+    "use as a mouthwash": ("93481000001108", "Use as a mouthwash"),
+}
+
+# ---------------------------------------------------------------------------
+# Derived from METHODS / COMPOUND_METHODS
+# ---------------------------------------------------------------------------
+METHOD_TO_SNOMED = {}
+for _verb, (_pp, _code, _display) in METHODS.items():
+    if _code is not None:
+        _entry = {"code": _code, "display": _display}
+        METHOD_TO_SNOMED[_verb] = _entry
+        # Also map the lemma form if it differs (e.g. "instill" from spaCy lemma of "instilled")
+        if _pp and _pp.endswith("ed"):
+            # crude lemma: strip -ed, -d; spaCy is more sophisticated but this catches instill→instilled
+            pass  # spaCy handles lemmatisation; we just need the base verb key above
+        # Map the American spelling "instill" explicitly (spaCy lemma of "instilled")
+        if _verb == "instil":
+            METHOD_TO_SNOMED["instill"] = _entry
+for _phrase, (_code, _display) in COMPOUND_METHODS.items():
+    METHOD_TO_SNOMED[_phrase] = {"code": _code, "display": _display}
+
+method_config = {
+    "options": list(METHODS.keys()),
+    "past_participles": [pp for _, (pp, _, _) in METHODS.items()],
+    "compound_options": list(COMPOUND_METHODS.keys()),
+    "prefixes": ["", "to be "],
+    "suffixes": ["", "n", "d", "ed"],
 }
 
 weekday_config = {
@@ -593,6 +769,13 @@ weekday_config = {
         "friday",
         "saturday",
         "sunday",
+        "mondays",
+        "tuesdays",
+        "wednesdays",
+        "thursdays",
+        "fridays",
+        "saturdays",
+        "sundays",
         "mon",
         "tue",
         "wed",
@@ -605,1629 +788,721 @@ weekday_config = {
     "suffixes": [""],
 }
 
+# ---------------------------------------------------------------------------
+# Derived from weekday_config
+# ---------------------------------------------------------------------------
+DAY_TO_FHIR = {
+    "monday": "mon",
+    "tuesday": "tue",
+    "wednesday": "wed",
+    "thursday": "thu",
+    "friday": "fri",
+    "saturday": "sat",
+    "sunday": "sun",
+    "mon": "mon",
+    "tue": "tue",
+    "wed": "wed",
+    "thu": "thu",
+    "fri": "fri",
+    "sat": "sat",
+    "sun": "sun",
+}
+
+# ---------------------------------------------------------------------------
+# WHEN_NOUNS — single source of truth for when/timing noun metadata.
+#
+# Each entry maps a when keyword to (timing_category, fhir_event_code).
+#   timing_category: how cross-column rules treat this noun:
+#       "specific"      — implies a daily cycle (one point per day)
+#       "generic"       — no timing cycle implied
+#       "multi_per_day" — implies multiple occurrences per day
+#   fhir_event_code: FHIR EventTiming code (e.g. "MORN") or None.
+#       When None, the noun may still get a FHIR code via WHEN_PREFIX_MAP
+#       (e.g. "before" + "breakfast" → "ACM") or route to additionalInstruction.
+#
+# To add a new when noun, add ONE line here.
+# ---------------------------------------------------------------------------
+WHEN_NOUNS = {
+    # keyword                 timing_category    fhir_event_code
+    # ── Specific (daily timing point, one per day) ────────────────────────
+    "morning": ("specific", "MORN"),
+    "afternoon": ("specific", "AFT"),
+    "evening": ("specific", "EVE"),
+    "night": ("specific", "NIGHT"),
+    "noon": ("specific", "NOON"),
+    "bedtime": ("specific", "HS"),
+    "waking": ("specific", "WAKE"),
+    "breakfast": ("specific", None),  # FHIR via prefix map only
+    "lunch": ("specific", None),  # FHIR via prefix map only
+    "lunchtime": ("specific", None),
+    "dinner": ("specific", None),  # FHIR via prefix map only
+    "evening meal": ("specific", None),
+    "morning meal": ("specific", None),
+    "teatime": ("specific", None),
+    "tea time": ("specific", None),  # space variant used by when_config
+    "sleep": ("specific", None),  # FHIR via prefix map (before sleep → HS)
+    "asleep": ("specific", None),  # from preprocessing: "after sleep" → "once asleep"
+    "procedure": ("specific", None),
+    # ── Generic (no timing cycle implied) ─────────────────────────────────
+    "food": ("generic", None),  # FHIR via SNOMED additional + prefix map
+    "meal": ("generic", None),  # FHIR via prefix map
+    "eat": ("generic", None),
+    "eating": ("generic", None),
+    "empty stomach": ("generic", None),  # FHIR via text-only additional
+    # ── Multi per day (implies multiple daily occurrences) ────────────────
+    "meals": ("multi_per_day", None),
+    "main meals": ("multi_per_day", None),
+    "each meal": ("multi_per_day", None),
+    "every meal": ("multi_per_day", None),
+    "each main meal": ("multi_per_day", None),
+    "every main meal": ("multi_per_day", None),
+    "foods": ("multi_per_day", None),
+    "bowel movements": ("multi_per_day", None),
+    "each bowel movement": ("multi_per_day", None),
+    "every bowel movement": ("multi_per_day", None),
+}
+
+# ---------------------------------------------------------------------------
+# Derived from WHEN_NOUNS
+# ---------------------------------------------------------------------------
+SPECIFIC_WHEN_KEYWORDS = frozenset(
+    k for k, (cat, _) in WHEN_NOUNS.items() if cat == "specific"
+)
+GENERIC_WHEN_KEYWORDS = frozenset(
+    k for k, (cat, _) in WHEN_NOUNS.items() if cat == "generic"
+)
+MULTI_PER_DAY_WHEN_KEYWORDS = frozenset(
+    k for k, (cat, _) in WHEN_NOUNS.items() if cat == "multi_per_day"
+)
+WHEN_OPTION_TO_FHIR = {k: code for k, (_, code) in WHEN_NOUNS.items() if code}
+
+# ---------------------------------------------------------------------------
+# FHIR when routing — prefix-based and additional instruction mappings.
+#
+# These describe *combinations* (preposition + noun → code) rather than
+# individual nouns, so they stay as separate dicts next to WHEN_NOUNS.
+# ---------------------------------------------------------------------------
+
+# Prefix-based: (preposition, noun) → FHIR EventTiming code.
+# Used when a noun alone has no fhir_event_code but gains one with a preposition.
+WHEN_PREFIX_MAP = {
+    ("before", "meal"): "AC",
+    ("before", "breakfast"): "ACM",
+    ("before", "lunch"): "ACD",
+    ("before", "dinner"): "ACV",
+    ("after", "food"): "PC",
+    ("after", "meal"): "PC",
+    ("after", "breakfast"): "PCM",
+    ("after", "lunch"): "PCD",
+    ("after", "dinner"): "PCV",
+    ("with", "meal"): "C",
+    ("with", "breakfast"): "CM",
+    ("with", "lunch"): "CD",
+    ("with", "dinner"): "CV",
+    ("before", "sleep"): "HS",
+}
+
+# Move to additionalInstruction WITH SNOMED code.
+# Key = substring to match in when_text; value = {code, display}.
+WHEN_TO_ADDITIONAL_INSTRUCTION_SNOMED = {
+    "before food": {"code": "311500009", "display": "Before food"},
+    "with food": {"code": "1116481000001105", "display": "With food"},
+    "after food": {"code": "225758001", "display": "After food"},
+}
+
+# Move to additionalInstruction as TEXT ONLY (no SNOMED code available).
+# NB: meal compound phrases (e.g. "evening meal") must be listed BEFORE bare
+# timing words (e.g. "evening") so they are caught here before WHEN_OPTION_TO_FHIR
+# would incorrectly map them to EVE/MORN etc.
+WHEN_TO_ADDITIONAL_INSTRUCTION_TEXT = [
+    "evening meal",
+    "morning meal",
+    "main meal",
+    "empty stomach",
+    "before noon",
+    "after noon",
+]
+
+# ---------------------------------------------------------------------------
+# METRIC_UNITS — single source of truth for metric/measurement unit metadata.
+#
+# Each entry maps a canonical name to (ucum_code, factor, category, aliases).
+#   ucum_code: FHIR UCUM code for this unit
+#   factor:    conversion factor to base unit within category
+#              (micrograms for mass, mL for volume, mmol for molar)
+#   category:  "mass", "volume", or "molar" — controls which units are
+#              comparable for range validation (e.g. 500mg to 1g is valid)
+#   aliases:   abbreviations and plural forms that appear in prescription text
+#
+# To add a new metric unit, add ONE line here.
+# ---------------------------------------------------------------------------
+METRIC_UNITS = {
+    "milligram": ("mg", 1000, "mass", ["mg", "mgs", "milligrams"]),
+    "microgram": ("ug", 1, "mass", ["mcg", "mcgs", "micrograms"]),
+    "gram": ("g", 1_000_000, "mass", ["g", "gs", "grams"]),
+    "nanogram": ("ng", 0.001, "mass", ["nanograms"]),
+    "millilitre": ("mL", 1, "volume", ["ml", "mls", "millilitres"]),
+    "litre": ("L", 1000, "volume", ["litres"]),
+    "millimol": ("mmol", 1, "molar", ["mmol", "mmols", "millimols"]),
+}
+
+# Derive milli_config from METRIC_UNITS
 milli_config = {
-    "options": [
-        "mg",
-        "ml",
-        "milligram",
-        "millilitre",
-        "mgs",
-        "mls",
-        "milligrams",
-        "millilitres",
-        "mcg",
-        "microgram",
-        "mcgs",
-        "micrograms",
-        "gram",
-        "g",
-        "grams",
-        "gs",
-        "nanogram",
-        "nanograms",
-        "millimol",
-        "millimols",
-        "mmol",
-        "mmols",
-        "litre",
-        "litres",
-    ],
+    "options": sorted(
+        {canonical for canonical in METRIC_UNITS}
+        | {alias for _, (_, _, _, aliases) in METRIC_UNITS.items() for alias in aliases}
+    ),
     "prefixes": [""],
     "suffixes": [""],
 }
 
-for_config = {
-    "options": [
-        "to help improve blood pressure control",
-        "for controlling high blood pressure",
-        "for controlling your blood pressure",
-        "for help controlling blood pressure",
-        "to help reduce your breathlessness",
-        "to help reduce your cardiovascular",
-        "to help reduce raised cholesterol",
-        "to help control high cholesterol",
-        "to help control your cholesterol",
-        "to help improve your cholesterol",
-        "to help reduce your constipation",
-        "to help treat raised cholesterol",
-        "to help control your high blood pressure",
-        "to help control your high blood clots",
-        "to help prevent protect stomach",
-        "to help reduce high cholesterol",
-        "to help reduce your cholesterol",
-        "to help treat your osteoporosis",
-        "to help treat your raised blood pressure",
-        "to help treat your raised blood clots",
-        "to reduce your high cholesterol",
-        "to help control breathlessness",
-        "to help improve breathlessness",
-        "to help lower control diabetes",
-        "to help lower high cholesterol",
-        "to help lower your cholesterol",
-        "to help prevent breathlessness",
-        "to help prevent cardiovascular",
-        "to help protect cardiovascular",
-        "to help relieve breathlessness",
-        "to help treat your cholesterol",
-        "to lower your high cholesterol",
-        "to prevent high blood pressure",
-        "to lower your your cholesterol",
-        "to protect your cardiovascular",
-        "to relieve your breathlessness",
-        "for lowering your cholesterol",
-        "for treating high cholesterol",
-        "to help control your diabetes",
-        "to help improve your diabetes",
-        "to help reduce breathlessness",
-        "to help reduce cardiovascular",
-        "to help reduce reduce stomach",
-        "to prevent raised cholesterol",
-        "to reduce control cholesterol",
-        "to reduce your cardiovascular",
-        "to treat prevent constipation",
-        "for controlling palpitations",
-        "for improving cardiovascular",
-        "for relieving breathlessness",
-        "to control your palpitations",
-        "to help control constipation",
-        "to help control palpitations",
-        "to help control your stomach",
-        "to help control your thyroid",
-        "to help improve constipation",
-        "to help improve palpitations",
-        "to help lower cardiovascular",
-        "to help lowering cholesterol",
-        "to help prevent constipation",
-        "to help prevent incontinence",
-        "to help prevent osteoporosis",
-        "to help prevent palpitations",
-        "to help protect your kidneys",
-        "to help protect your stomach",
-        "to help relieve constipation",
-        "to help relieve palpitations",
-        "to lower your cardiovascular",
-        "to reduce raised cholesterol",
-        "for controlling cholesterol",
-        "for lowering cardiovascular",
-        "for preventing constipation",
-        "for preventing incontinence",
-        "for preventing osteoporosis",
-        "for preventing palpitations",
-        "for protecting your kidneys",
-        "for protecting your stomach",
-        "for your raised cholesterol",
-        "to aid lowering cholesterol",
-        "to control high cholesterol",
-        "to control your cholesterol",
-        "to help control cholesterol",
-        "to help control indigestion",
-        "to help control low thyroid",
-        "to help control neuropathic",
-        "to help control your angina",
-        "to help improve cholesterol",
-        "to help lowering high blood pressure",
-        "to help lowering high blood clots",
-        "to help prevent indigestion",
-        "to help prevent neuropathic",
-        "to help reduce constipation",
-        "to help reduce palpitations",
-        "to help reduce raised blood pressure",
-        "to help reduce raised blood clots",
-        "to help reduce your stomach",
-        "to help relieve neuropathic",
-        "to help treat your diabetes",
-        "to help your breathlessness",
-        "to improve control diabetes",
-        "to improve your cholesterol",
-        "to lower raised cholesterol",
-        "to lower reduce cholesterol",
-        "to prevent high cholesterol",
-        "to reduce your palpitations",
-        "to treat raised cholesterol",
-        "for preventing your angina",
-        "for relieving constipation",
-        "to help aid breathlessness",
-        "to help control high blood pressure",
-        "to help control high blood clots",
-        "to help control high heart",
-        "to help control your blood pressure",
-        "to help control your blood clots",
-        "to help control your heart",
-        "to help control your nerve",
-        "to help control your sugar",
-        "to help improve your blood pressure",
-        "to help improve your blood clots",
-        "to help improve your bowel",
-        "to help improve your heart",
-        "to help prevent high blood pressure",
-        "to help prevent high blood clots",
-        "to help protect your blood pressure",
-        "to help protect your blood clots",
-        "to help protect your bones",
-        "to help low blood pressure",
-        "to help protect your heart",
-        "to help reduce cholesterol",
-        "to help reduce indigestion",
-        "to help reduce lower blood pressure",
-        "to help reduce lower blood clots",
-        "to help reduce your wheeze",
-        "to help treat constipation",
-        "to help treat osteoporosis",
-        "to help treat palpitations",
-        "to reduce help cholesterol",
-        "to reduce high cholesterol",
-        "to reduce your cholesterol",
-        "for controlling your copd",
-        "for improving cholesterol",
-        "for protecting your heart",
-        "for raised cardiovascular",
-        "for reducing constipation",
-        "for treating constipation",
-        "for treating osteoporosis",
-        "for treating raised blood pressure",
-        "for treating raised blood clots",
-        "for your high cholesterol",
-        "to control breathlessness",
-        "to control cardiovascular",
-        "to help control irritable bowel symptoms",
-        "to help control irritable bowel syndrome",
-        "to help control irritable bladder",
-        "to help control irritable bowel",
-        "to help control irritable skin",
-        "to help control your mood",
-        "to help control your pain",
-        "to help control your skin",
-        "to help improve your mood",
-        "to help lower cholesterol",
-        "to help prevent fractures",
-        "to help prevent low blood pressure",
-        "to help prevent low blood clots",
-        "to help prevent your gout",
-        "to help reduce high blood pressure",
-        "to help reduce high blood clots",
-        "to help reduce your blood pressure",
-        "to help reduce your blood clots",
-        "to help reduce your heart",
-        "to help reduce your nerve",
-        "to help relieve irritable bowel symptoms",
-        "to help relieve irritable bowel syndrome",
-        "to help relieve irritable bladder",
-        "to help relieve irritable bowel",
-        "to help relieve irritable skin",
-        "to help treat cholesterol",
-        "to help treat low thyroid",
-        "to help your osteoporosis",
-        "to help your palpitations",
-        "to improve breathlessness",
-        "to improve cardiovascular",
-        "to lower high cholesterol",
-        "to lower your cholesterol",
-        "to prevent breathlessness",
-        "to prevent cardiovascular",
-        "to protect cardiovascular",
-        "to reduce protect stomach",
-        "to reduce your high blood pressure",
-        "to reduce your high blood clots",
-        "to relieve breathlessness",
-        "to treat high cholesterol",
-        "for controlling diabetes",
-        "for helping constipation",
-        "for lowering cholesterol",
-        "for treating cholesterol",
-        "to aid your palpitations",
-        "to control your diabetes",
-        "to help control diabetes",
-        "to help control low mood",
-        "to help control pressure",
-        "to help control prostate",
-        "to help improve diabetes",
-        "to help improve low iron",
-        "to help improve low mood",
-        "to help improve prostate",
-        "to help lower high blood pressure",
-        "to help lower high blood clots",
-        "to help lower your blood pressure",
-        "to help lower your blood clots",
-        "to help lower your heart",
-        "to help lower your sugar",
-        "to help prevent diabetes",
-        "to help prevent low mood",
-        "to help prevent pressure",
-        "to help prevent prostate",
-        "to help preventing blood pressure",
-        "to help preventing blood clots",
-        "to help preventing heart",
-        "to help protect pressure",
-        "to help reduce irritable bowel symptoms",
-        "to help reduce irritable bowel syndrome",
-        "to help reduce irritable bladder",
-        "to help reduce irritable bowel",
-        "to help reduce irritable skin",
-        "to help reduce raised bp",
-        "to help reduce your pain",
-        "to help reduce your risk",
-        "to help relieve low mood",
-        "to help relieve pressure",
-        "to help relieve prostate",
-        "to help treat high blood pressure",
-        "to help treat high blood clots",
-        "to help treat your heart",
-        "to help your cholesterol",
-        "to help your neuropathic",
-        "to improve control blood pressure",
-        "to improve control blood clots",
-        "to improve your diabetes",
-        "to lower raised pressure",
-        "to lower your high blood pressure",
-        "to lower your high blood clots",
-        "to prevent high pressure",
-        "to reduce breathlessness",
-        "to reduce cardiovascular",
-        "to relieve your low mood",
-        "to treat raised pressure",
-        "to reduce blood pressure",
-        "to treat your high blood pressure",
-        "to treat your high blood clots",
-        "for controlling chronic",
-        "for controlling high bp",
-        "for high cardiovascular",
-        "for lowering high blood pressure",
-        "for lowering high blood clots",
-        "for lowering your blood pressure",
-        "for lowering your blood clots",
-        "for preventing pressure",
-        "for treating high blood pressure",
-        "for treating high blood clots",
-        "for your cardiovascular",
-        "to control constipation",
-        "to control incontinence",
-        "to control osteoporosis",
-        "to control palpitations",
-        "to control your stomach",
-        "to control your thyroid",
-        "to help control chronic",
-        "to help control high bp",
-        "to help control stomach",
-        "to help control thyroid",
-        "to help control your bp",
-        "to help improve anaemia",
-        "to help improve chronic",
-        "to help loosening mucus",
-        "to help lower your risk",
-        "to help prevent anaemia",
-        "to help prevent chronic",
-        "to help prevent stomach",
-        "to help prevent strokes",
-        "to help protect kidneys",
-        "to help protect stomach",
-        "to help reduce diabetes",
-        "to help reduce low mood",
-        "to help reduce pressure",
-        "to help reduce prostate",
-        "to help relieve chronic",
-        "to help relieve stomach",
-        "to help treat low sugar",
-        "to help treat your mood",
-        "to improve constipation",
-        "to improve incontinence",
-        "to improve palpitations",
-        "to improve raised blood pressure",
-        "to improve raised blood clots",
-        "to improve your stomach",
-        "to lower cardiovascular",
-        "to lower lower pressure",
-        "to prevent constipation",
-        "to prevent higher blood pressure",
-        "to prevent higher blood clots",
-        "to prevent incontinence",
-        "to prevent osteoporosis",
-        "to prevent palpitations",
-        "to prevent raised blood pressure",
-        "to prevent raised blood clots",
-        "to prevent your stomach",
-        "to protect incontinence",
-        "to protect your kidneys",
-        "to protect your stomach",
-        "to reduce high pressure",
-        "to relieve constipation",
-        "to relieve palpitations",
-        "to treat breathlessness",
-        "for controlling angina",
-        "for improving diabetes",
-        "for preventing stomach",
-        "for preventing strokes",
-        "for protecting kidneys",
-        "for protecting stomach",
-        "for raised cholesterol",
-        "for treating low blood pressure",
-        "for treating low blood clots",
-        "to control cholesterol",
-        "to control indigestion",
-        "to control neuropathic",
-        "to control your angina",
-        "to help aid your sleep",
-        "to help breathlessness",
-        "to help cardiovascular",  # check
-        "to help control angina",
-        "to help control muscle",
-        "to help control wheeze",
-        "to help improve angina",
-        "to help improve sputum",
-        "to help lower pressure",
-        "to help lowering blood pressure",
-        "to help lowering blood clots",
-        "to help prevent angina",
-        "to help prevent low bp",
-        "to help prevent muscle",
-        "to help prevent wheeze",
-        "to help reduce chronic",
-        "to help reduce high bp",
-        "to help reduce stomach",
-        "to help reduce strokes",
-        "to help reduce your bp",
-        "to help relieve angina",
-        "to help relieve muscle",
-        "to help relieve wheeze",
-        "to help treat diabetes",
-        "to help treat low iron",
-        "to help treat low mood",
-        "to help treat prostate",
-        "to help your irritable bowel symptoms",
-        "to help your irritable bowel syndrome",
-        "to help your irritable bladder",
-        "to help your irritable bowel",
-        "to help your irritable skin",
-        "to improve cholesterol",
-        "to improve neuropathic",
-        "to lower control blood pressure",
-        "to lower control blood clots",
-        "to prevent cholesterol",
-        "to prevent indigestion",
-        "to prevent low thyroid",
-        "to prevent neuropathic",
-        "to prevent prophylaxis",
-        "to prevent your angina",
-        "to protect lower blood pressure",
-        "to protect lower blood clots",
-        "to reduce constipation",
-        "to reduce incontinence",
-        "to reduce osteoporosis",
-        "to reduce palpitations",
-        "to reduce prevent gout",
-        "to reduce raised blood pressure",
-        "to reduce raised blood clots",
-        "to reduce reduce blood pressure",
-        "to reduce reduce blood clots",
-        "to reduce your kidneys",
-        "to reduce your stomach",
-        "to relieve indigestion",
-        "to relieve neuropathic",
-        "to treat high pressure",
-        "to treat your diabetes",
-        "to treat your low iron",
-        "to treat your low mood",
-        "for controlling blood pressure",
-        "for controlling blood clots",
-        "for controlling bowel",
-        "for controlling heart",
-        "for controlling sugar",
-        "for lower cholesterol",
-        "for preventing angina",
-        "for raised high blood pressure",
-        "for raised high blood clots",
-        "for treating diabetes",
-        "for your constipation",
-        "for your incontinence",
-        "for your osteoporosis",
-        "for your palpitations",
-        "for your raised blood pressure",
-        "for your raised blood clots",
-        "to aid breathlessness",
-        "to aid improved sleep",
-        "to control high blood pressure",
-        "to control high blood clots",
-        "to control high heart",
-        "to control your blood pressure",
-        "to control your blood clots",
-        "to control your heart",
-        "to control your sugar",
-        "to help constipations",
-        "to help control blood pressure",
-        "to help control blood clots",
-        "to help control bowel",
-        "to help control heart",
-        "to help control nerve",
-        "to help control sleep",
-        "to help control sugar",
-        "to help improve bowel",
-        "to help improve heart",
-        "to help improve mucus",
-        "to help improve sleep",
-        "to help loosen sputum",
-        "to help lower high bp",
-        "to help lower stomach",
-        "to help lower your bp",
-        "to help prevent blood pressure",
-        "to help prevent blood clots",
-        "to help prevent bowel",
-        "to help prevent clots",
-        "to help prevent heart",
-        "to help prevent sleep",
-        "to help prevent stoke",
-        "to help prevent ulcer",
-        "to help protect blood pressure",
-        "to help protect blood clots",
-        "to help protect bones",
-        "to help protect heart",
-        "to help reduce angina",
-        "to help reduce muscle",
-        "to help reduce sputum",
-        "to help reduce wheeze",
-        "to help reduced blood pressure",
-        "to help reduced blood clots",
-        "to help relieve bowel",
-        "to help relieve mucus",
-        "to help relieve nerve",
-        "to help relieve sleep",
-        "to help treat anaemia",
-        "to help treat chronic",
-        "to help treat thyroid",
-        "to help your diabetes",
-        "to help your prostate",
-        "to improve high blood pressure",
-        "to improve high blood clots",
-        "to improve lower mood",
-        "to improve your blood pressure",
-        "to improve your blood clots",
-        "to improve your bones",
-        "to improve your heart",
-        "to improve your sugar",
-        "to lower raised blood pressure",
-        "to lower raised blood clots",
-        "to prevent deficiency",
-        "to prevent high sugar",
-        "to prevent your heart",
-        "to protect your blood pressure",
-        "to protect your blood clots",
-        "to protect your bones",
-        "to protect your heart",
-        "to protect your nerve",
-        "to raised cholesterol",
-        "to reduce cholesterol",
-        "to reduce indigestion",
-        "to reduce neuropathic",
-        "to treat constipation",
-        "to treat incontinence",
-        "to treat osteoporosis",
-        "to treat palpitations",
-        "to treat raised blood pressure",
-        "to treat raised blood clots",
-        "to treat your chronic",
-        "to treat your thyroid",
-        "for controlled spasm",
-        "for controlling copd",
-        "for controlling gout",
-        "for controlling mood",
-        "for controlling pain",
-        "for helping lower bp",
-        "for high cholesterol",
-        "for loosening sputum",
-        "for lowering stomach",
-        "for preventing blood pressure",
-        "for preventing blood clots",
-        "for preventing clots",
-        "for preventing heart",
-        "for protecting bones",
-        "for protecting heart",
-        "for reducing stomach",
-        "for relieving wheeze",
-        "for treating chronic",
-        "for your cholesterol",
-        "for your neuropathic",  # check
-        "to control your copd",
-        "to control your gout",
-        "to control your mood",
-        "to control your pain",
-        "to control your skin",
-        "to help constipation",
-        "to help control copd",
-        "to help control gout",
-        "to help control mood",
-        "to help control pain",
-        "to help improve iron",
-        "to help improve mood",
-        "to help improve pain",
-        "to help improve skin",
-        "to help incontinence",
-        "to help loosen mucus",
-        "to help lower sputum",
-        "to help osteoporosis",
-        "to help palpitations",
-        "to help prevent copd",
-        "to help prevent gout",
-        "to help prevent iron",
-        "to help prevent mood",
-        "to help prevent pain",
-        "to help prevent risk",
-        "to help prevent skin",
-        "to help protect from",
-        "to help protect skin",
-        "to help reduce blood pressure",
-        "to help reduce blood clots",
-        "to help reduce bowel",
-        "to help reduce clots",
-        "to help reduce heart",
-        "to help reduce mucus",
-        "to help reduce nerve",
-        "to help reduce spasm",
-        "to help reduce sugar",
-        "to help relieve pain",
-        "to help relieve skin",
-        "to help treat angina",
-        "to help your anaemia",
-        "to help your kidneys",
-        "to help your stomach",
-        "to help your thyroid",
-        "to improve low blood pressure",
-        "to improve low blood clots",
-        "to improve raised bp",
-        "to improve your iron",
-        "to improve your mood",
-        "to lower cholesterol",
-        "to lower lower blood pressure",
-        "to lower lower blood clots",
-        "to prevent fractures",
-        "to prevent irritable bowel symptoms",
-        "to prevent irritable bowel syndrome",
-        "to prevent irritable bladder",
-        "to prevent irritable bowel",
-        "to prevent irritable skin",
-        "to prevent low blood pressure",
-        "to prevent low blood clots",
-        "to prevent low sugar",
-        "to prevent your gout",
-        "to protect your skin",
-        "to reduce help blood pressure",
-        "to reduce help blood clots",
-        "to reduce high blood pressure",
-        "to reduce high blood clots",
-        "to reduce your blood pressure",
-        "to reduce your blood clots",
-        "to reduce your heart",
-        "to reduce your sugar",
-        "to relieve your copd",
-        "to treat cholesterol",
-        "to treat indigestion",
-        "to treat low thyroid",
-        "to treat neuropathic",
-        "to treat your angina",
-        "for helping kidneys",
-        "for higher diabetes",
-        "for improving blood pressure",
-        "for improving blood clots",
-        "for improving heart",
-        "for improving sleep",
-        "for loosening mucus",
-        "for low cholesterol",
-        "for preventing gout",
-        "for protecting skin",
-        "for raised pressure",
-        "for relieving spasm",
-        "for treating angina",
-        "for your high blood pressure",
-        "for your high blood clots",
-        "for your your heart",
-        "to aid constipation",
-        "to aid palpitations",
-        "to control diabetes",
-        "to control low mood",
-        "to control pressure",
-        "to control prostate",
-        "to help cholesterol",
-        "to help indigestion",
-        "to help lower blood pressure",
-        "to help lower blood clots",
-        "to help lower heart",
-        "to help lower sugar",
-        "to help neuropathic",
-        "to help prophylaxis",
-        "to help raise blood pressure",
-        "to help raise blood clots",
-        "to help reduce gout",
-        "to help reduce pain",
-        "to help reduce risk",
-        "to help reduce size",
-        "to help reduce skin",
-        "to help treat blood pressure",
-        "to help treat blood clots",
-        "to help treat bowel",
-        "to help treat heart",
-        "to help treat mucus",
-        "to help treat nerve",
-        "to help your muscle",
-        "to help your wheeze",
-        "to high cholesterol",
-        "to improve diabetes",
-        "to improve low iron",
-        "to improve low mood",
-        "to improve prostate",
-        "to lower help blood pressure",
-        "to lower help blood clots",
-        "to lower high blood pressure",
-        "to lower high blood clots",
-        "to lower your blood pressure",
-        "to lower your blood clots",
-        "to lower your heart",
-        "to lower your sugar",
-        "to prevent diabetes",
-        "to prevent low iron",
-        "to prevent low mood",
-        "to prevent pressure",
-        "to prevent prostate",
-        "to protect diabetes",
-        "to protect pressure",
-        "to reduce irritable bowel symptoms",
-        "to reduce irritable bowel syndrome",
-        "to reduce irritable bladder",
-        "to reduce irritable bowel",
-        "to reduce irritable skin",
-        "to reduce low blood pressure",
-        "to reduce low blood clots",
-        "to reduce raised bp",
-        "to reduce your risk",
-        "to reduce your skin",
-        "to relieve low mood",
-        "to relieve pressure",
-        "to relieve prostate",
-        "to treat deficiency",
-        "to treat high blood pressure",
-        "to treat high blood clots",
-        "to treat high heart",
-        "to treat high sugar",
-        "to treat your blood pressure",
-        "to treat your blood clots",
-        "to treat your heart",
-        "to your cholesterol",
-        "for breathlessness",
-        "for cardiovascular",  # check
-        "for controlling bp",
-        "for helping sputum",
-        "for improving iron",
-        "for improving mood",
-        "for improving pain",
-        "for low deficiency",  # check
-        "for lowering blood pressure",
-        "for lowering blood clots",
-        "for lowering sugar",
-        "for treating blood pressure",
-        "for treating blood clots",
-        "for treating heart",
-        "for treating ulcer",
-        "for your low blood pressure",
-        "for your low blood clots",
-        "to aid cholesterol",
-        "to aid neuropathic",
-        "to control chronic",
-        "to control disease",
-        "to control high bp",
-        "to control stomach",
-        "to control thyroid",
-        "to control your bp",
-        "to help aid sputum",
-        "to help control bp",
-        "to help high blood pressure",
-        "to help high blood clots",
-        "to help lower risk",
-        "to help raise iron",
-        "to help raise mood",
-        "to help reduce cvd",
-        "to help treat mood",
-        "to help treat pain",
-        "to help treat skin",
-        "to help your blood pressure",
-        "to help your blood clots",
-        "to help your bones",
-        "to help your bowel",
-        "to help your heart",
-        "to help your lungs",
-        "to help your sleep",
-        "to help your sugar",
-        "to help your ulcer",
-        "to improve anaemia",
-        "to improve chronic",
-        "to improve stomach",
-        "to improve thyroid",
-        "to low cholesterol",
-        "to lower your risk",
-        "to prevent anaemia",
-        "to prevent chronic",
-        "to prevent stomach",
-        "to prevent strokes",
-        "to prevent thyroid",
-        "to protect kidneys",
-        "to protect stomach",
-        "to reduce diabetes",
-        "to reduce low mood",
-        "to reduce pressure",
-        "to reduce prostate",
-        "to relieve chronic",
-        "to relieve stomach",
-        "to treat irritable bowel symptoms",
-        "to treat irritable bowel syndrome",
-        "to treat irritable bladder",
-        "to treat irritable bowel",
-        "to treat irritable skin",
-        "to treat low blood pressure",
-        "to treat low blood clots",
-        "to treat low sugar",
-        "to treat raised bp",
-        "to treat your copd",
-        "for helping bones",
-        "for helping bowel",
-        "for helping heart",
-        "for helping sleep",
-        "for high pressure",
-        "for lower stomach",
-        "for lowering mood",
-        "for lowering risk",
-        "for reduced sleep",
-        "for treating gout",
-        "for treating mood",
-        "for treating pain",
-        "for your diabetes",
-        "for your low iron",
-        "for your low mood",
-        "for your prostate",
-        "to aid your sleep",
-        "to control angina",
-        "to control muscle",
-        "to control sputum",
-        "to control wheeze",
-        "to help aid mucus",
-        "to help aid sleep",
-        "to help reduce bp",
-        "to help reduce by",
-        "to help your copd",
-        "to help your iron",
-        "to help your mood",
-        "to help your pain",
-        "to help your skin",
-        "to improve angina",
-        "to improve muscle",
-        "to improve sputum",
-        "to improve wheeze",
-        "to lower pressure",
-        "to prevent angina",
-        "to prevent low bp",
-        "to prevent muscle",
-        "to prevent sputum",
-        "to prevent wheeze",
-        "to protects bones",
-        "to reduce chronic",
-        "to reduce kidneys",
-        "to reduce stomach",
-        "to reduce strokes",
-        "to reduce thyroid",
-        "to reduce your bp",
-        "for heart failure",
-        "to relieve angina",
-        "to relieve muscle",
-        "to relieve sputum",
-        "to relieve wheeze",
-        "to treat diabetes",
-        "to treat low iron",
-        "to treat low mood",
-        "to treat pressure",
-        "to treat prostate",
-        "for aiding sleep",
-        "for constipation",
-        "for helping mood",
-        "for helping pain",
-        "for high thyroid",
-        "for higher blood pressure",
-        "for higher blood clots",
-        "for improving bp",
-        "for incontinence",
-        "for low pressure",
-        "for osteoporosis",
-        "for palpitations",
-        "for raised blood pressure",
-        "for raised blood clots",
-        "for raised heart",
-        "for raised level",
-        "for raised sugar",
-        "for reduced iron",
-        "for your anaemia",
-        "for your chronic",
-        "for your kidneys",
-        "for your stomach",
-        "for your thyroid",
-        "to control blood pressure",
-        "to control blood clots",
-        "to control bowel",
-        "to control clots",
-        "to control heart",
-        "to control mucus",
-        "to control nerve",
-        "to control pains",
-        "to control sleep",
-        "to control spasm",
-        "to control sugar",
-        "to help diabetes",
-        "to help low iron",
-        "to help low mood",
-        "to help lower bp",
-        "to help pressure",
-        "to help prostate",
-        "to help raise bp",
-        "to help sleeping",
-        "to high pressure",  # check
-        "to improve blood pressure",
-        "to improve blood clots",
-        "to improve bones",
-        "to improve bowel",
-        "to improve heart",
-        "to improve level",
-        "to improve nerve",
-        "to improve sleep",
-        "to improve sugar",
-        "to improve ulcer",
-        "to loosen muscle",
-        "to loosen sputum",
-        "to lower high bp",
-        "to lower stomach",
-        "to lower thyroid",
-        "to lower your bp",
-        "to prevent clots",
-        "to prevent level",  # check
-        "to prevent mucus",
-        "to prevent nerve",  # check
-        "to prevent sleep",  # check
-        "to prevent spasm",
-        "to prevent stoke",
-        "to prevent sugar",  # check
-        "to prevent ulcer",
-        "to protect blood pressure",
-        "to protect blood clots",
-        "to protect bones",
-        "to protect heart",
-        "to protect nerve",
-        "to reduce angina",
-        "to reduce low bp",  # check
-        "to reduce muscle",
-        "to reduce sputum",
-        "to reduce wheeze",
-        "to relieve bowel",
-        "to relieve mucus",
-        "to relieve nerve",
-        "to relieve spasm",
-        "to treat anaemia",
-        "to treat chronic",
-        "to treat high bp",
-        "to treat kidneys",
-        "to treat stomach",
-        "to treat thyroid",
-        "for cholesterol",
-        "for high angina",
-        "for higher risk",  # check
-        "for indigestion",
-        "for low thyroid",  # check
-        "for lower blood pressure",
-        "for lower blood clots",
-        "for lower bowel",
-        "for lower sugar",
-        "for lowering bp",
-        "for neuropathic",  # check
-        "for prophylaxis",
-        "for your angina",
-        "for your muscle",
-        "for your wheeze",
-        "to aid diabetes",
-        "to aid low mood",
-        "to aid pressure",
-        "to control copd",
-        "to control gout",
-        "to control mood",
-        "to control pain",
-        "to control skin",
-        "to help anaemia",
-        "to help high bp",
-        "to help kidneys",
-        "to help stomach",
-        "to help thyroid",
-        "to help your bp",
-        "to higher level",  # check
-        "to improve copd",
-        "to improve gout",
-        "to improve iron",
-        "to improve mood",
-        "to improve pain",
-        "to improve skin",
-        "to loosen bowel",
-        "to loosen mucus",
-        "to prevent copd",
-        "to prevent gout",
-        "to prevent iron",
-        "to prevent mood",  # check
-        "to prevent pain",
-        "to prevent risk",
-        "to prevent skin",
-        "to protect gout",  # check
-        "to protect skin",
-        "to reduce bowel",
-        "to reduce clots",
-        "to reduce heart",
-        "to reduce level",  # check
-        "to reduce mucus",
-        "to reduce nerve",
-        "to reduce spasm",
-        "to reduce stoke",
-        "to reduce sugar",
-        "to reduce ulcer",
-        "to relieve copd",
-        "to relieve gout",
-        "to relieve pain",
-        "to relieve skin",
-        "to treat angina",
-        "to treat low bp",
-        "to treat muscle",
-        "to treat wheeze",
-        "for deficiency",  # check
-        "for high blood pressure",
-        "for high blood clots",
-        "for high heart",  # check
-        "for high level",  # check
-        "for high sugar",
-        "for nerve pain",
-        "for lower pain",
-        "for lower risk",  # check
-        "for raised cvd",
-        "for your blood pressure",
-        "for your blood clots",
-        "for your bones",
-        "for your bowel",
-        "for your heart",
-        "for your lungs",
-        "for your mucus",
-        "for your nerve",
-        "for your sleep",
-        "for your sugar",
-        "for your ulcer",
-        "to aid anaemia",
-        "to aid chronic",
-        "to aid stomach",
-        "to cholesterol",
-        "to control cvd",
-        "to help angina",
-        "to help low bp",
-        "to help muscle",
-        "to help relief",
-        "to help sputum",
-        "to help wheeze",
-        "to higher risk",  # check
-        "to loosen skin",
-        "to low kidneys",  # check
-        "to lower blood pressure",
-        "to lower blood clots",
-        "to lower heart",
-        "to lower level",
-        "to lower sugar",
-        "to neuropathic",  # check
-        "to prevent cvd",
-        "to prophylaxis",  # check
-        "to raise blood pressure",
-        "to raise blood clots",
-        "to raised skin",
-        "to reduce copd",
-        "to reduce gout",
-        "to reduce iron",
-        "to reduce mood",
-        "to reduce pain",
-        "to reduce risk",
-        "to reduce size",
-        "to reduced cvd",  # check
-        "to treat blood pressure",
-        "to treat blood clots",
-        "to treat bones",
-        "to treat bowel",
-        "to treat clots",
-        "to treat heart",
-        "to treat lungs",
-        "to treat mucus",  # check
-        "to treat nerve",  # check
-        "to treat sleep",
-        "to treat spasm",
-        "to treat ulcer",
-        "to your angina",  # check
-        "for high mood",  # check
-        "for high risk",  # check
-        "for low blood pressure",
-        "for low blood clots",
-        "for low heart",  # check
-        "for low level",
-        "for low sugar",
-        "for raised bp",
-        "for your copd",
-        "for your gout",
-        "for your iron",
-        "for your mood",
-        "for your pain",
-        "for your skin",
-        "to aid muscle",
-        "to aid relief",
-        "to aid sputum",
-        "to control bp",
-        "to help blood pressure",
-        "to help blood clots",
-        "to help bones",
-        "to help bowel",
-        "to help heart",
-        "to help lungs",
-        "to help mucus",  # check
-        "to help nerve",  # check
-        "to help sleep",
-        "to help spasm",
-        "to help sugar",
-        "to help ulcer",
-        "to improve bp",
-        "to lower gout",  # check
-        "to lower mood",  # check
-        "to lower pain",
-        "to lower risk",
-        "to prevent bp",  # check
-        "to protect bp",
-        "to raise iron",
-        "to raise mood",
-        "to reduce cvd",
-        "to treat copd",
-        "to treat gout",
-        "to treat iron",
-        "to treat mood",
-        "to treat pain",
-        "to treat skin",
-        "for diabetes",
-        "for high cvd",
-        "for low iron",
-        "for low mood",
-        "for lower bp",
-        "for pressure",
-        "for prostate",
-        "for sleeping",
-        "to aid blood pressure",
-        "to aid blood clots",
-        "to aid bowel",
-        "to aid heart",
-        "to aid mucus",
-        "to aid nerve",
-        "to aid sleep",
-        "to aid spasm",
-        "to aid ulcer",
-        "to help copd",
-        "to help gout",
-        "to help iron",
-        "to help mood",
-        "to help pain",
-        "to help skin",
-        "to lower cvd",
-        "to raised bp",
-        "to reduce bp",
-        "for anaemia",
-        "for disease",
-        "for high bp",
-        "for kidneys",
-        "for stomach",
-        "for strokes",
-        "for thyroid",
-        "for your bp",
-        "to aid copd",
-        "to aid iron",
-        "to aid mood",
-        "to aid pain",
-        "to aid skin",
-        "to help cvd",
-        "to lower bp",
-        "to raise bp",
-        "to treat bp",
-        "for angina",
-        "for low bp",
-        "for muscle",
-        "for relief",
-        "for sputum",
-        "for ulcers",
-        "for wheeze",
-        "for blood pressure",
-        "for blood clots",
-        "for bones",
-        "for bowel",
-        "for clots",
-        "for heart",
-        "for lungs",
-        "for mucus",
-        "for pains",
-        "for sleep",
-        "for spasm",
-        "for sugar",
-        "for ulcer",
-        "to aid bp",
-        "for copd",
-        "for gout",
-        "for iron",
-        "for mood",
-        "for pain",
-        "for cvd",
-        "for bp",
-    ]
+# ---------------------------------------------------------------------------
+# Derived from METRIC_UNITS
+# ---------------------------------------------------------------------------
+METRIC_UNIT_TO_UCUM = {}
+UNIT_TO_MICROGRAMS = {}
+MASS_UNITS: set[str] = set()
+VOLUME_UNITS: set[str] = set()
+for _canonical, (_ucum, _factor, _category, _aliases) in METRIC_UNITS.items():
+    METRIC_UNIT_TO_UCUM[_canonical] = _ucum
+    for _alias in _aliases:
+        METRIC_UNIT_TO_UCUM[_alias] = _ucum
+    _all_forms = [_canonical] + _aliases
+    for _form in _all_forms:
+        UNIT_TO_MICROGRAMS[_form] = _factor
+        if _category == "mass":
+            MASS_UNITS.add(_form)
+        elif _category == "volume":
+            VOLUME_UNITS.add(_form)
+
+
+# ---------------------------------------------------------------------------
+# for_config — regex-based extraction of purpose/indication phrases
+#
+# Item groups control which qualifiers and verbs are semantically valid:
+#   _HIGH_ITEMS      → things that can be high/raised → reduce/lower/control verbs
+#   _LOW_ITEMS       → things that can be low → raise/improve/treat verbs
+#   _DUAL_ITEMS      → can be high OR low (blood pressure, sugar, bp) → both verb sets
+#   _CONDITION_ITEMS → abstract conditions → neutral verbs only, "your" qualifier only
+#   _BODY_SITE_NOUNS → physical organs → help/protect/treat + "your" only
+#   _PAIN_TYPES      → site+pain compounds → relieve/reduce/treat/help/prevent
+# ---------------------------------------------------------------------------
+
+# Things that can be high/raised — only valid with reduce/lower/control verbs
+_HIGH_ITEMS = (
+    r"cholesterol"
+    r"|cardiovascular risk"
+    r"|cvd risk"
+    r"|palpitations?"  # ? allows singular "palpitation"
+    r"|angina"
+    r"|heart rate"
+    r"|blood clots?"
+    r"|stomach acid"
+)
+
+# Things that can be low — only valid with raise/improve verbs
+_LOW_ITEMS = (
+    r"iron(?: levels?)?"
+    r"|mood"
+    r"|folate"
+    r"|folic acid(?: levels?)?"
+    r"|vitamin (?:d|b12)(?: levels?)?"
+    r"|thyroid(?: levels?)?"
+)
+
+# Can be high OR low — added to both high and low blocks with their respective verbs
+_DUAL_ITEMS = r"blood pressure" r"|blood sugar" r"|sugar(?: levels?)?" r"|bp"
+
+_CONDITION_ITEMS = (
+    r"diabetes"
+    r"|breathlessness"
+    r"|constipation"
+    r"|osteoporosis"
+    r"|incontinence"
+    r"|copd"
+    r"|gout"
+    r"|anaemia"
+    r"|indigestion"
+    r"|insomnia"
+    r"|anxiety"
+    r"|allergies"
+    r"|allergy"
+    r"|nausea"
+    r"|dizziness"
+    r"|bowel(?:s| (?:symptoms?|syndrome|spasm))?"
+    r"|irritable (?:bowel(?: syndrome)?|bladder|skin)"
+    r"|bladder"
+    r"|sputum"
+    r"|wheeze"
+    r"|mucus"
+    r"|spasm"
+    r"|sleep"
+    r"|prostate"
+    r"|deficiency"
+    r"|prophylaxis"
+    r"|thyroid"
+    r"|chronic (?:migraine|urticaria|rhinitis|fatigue)"
+    r"|ulcer"
+    r"|fractures?"
+    r"|clots?"
+    r"|disease"
+    r"|infections?"
+    r"|heart (?:failure|attack|disease)"
+    r"|strokes?"
+    r"|cardiovascular(?: disease)?"
+    r"|cvd"
+    r"|dry eyes"
+)
+
+_BODY_SITE_NOUNS = (
+    r"heart"
+    r"|kidneys?"
+    r"|stomach"
+    r"|bones?"
+    r"|lungs?"
+    r"|skin"
+    r"|bowels?"
+    r"|bladder"
+    r"|liver"
+    r"|nerves?"
+    r"|back"
+    r"|neck"
+    r"|legs?"
+    r"|joints?"
+    r"|chest"
+)
+
+_CONTROL_NOUNS = (
+    r"blood pressure" r"|bladder" r"|cholesterol" r"|pain" r"|bowel" r"|sugar" r"|bp"
+)
+
+_PAIN_TYPES = (
+    r"muscle (?:pain|spasm|tightness|rigidity)"  # compound — can't split to site+pain
+    r"|nerve[ -]?related pain"
+    r"|neuropathic pain"
+    r"|pain relief"
+    r"|(?:severe|chronic|breakthrough) (?:(?:{_BODY_SITE_NOUNS}) )?pain"
+    r"|(?:{_BODY_SITE_NOUNS}) pain"
+    r"|pain"
+)
+# Expand _BODY_SITE_NOUNS reference in _PAIN_TYPES at definition time
+_PAIN_TYPES = _PAIN_TYPES.format(_BODY_SITE_NOUNS=_BODY_SITE_NOUNS)
+
+_RISK_EVENTS = (
+    r"heart attacks?"
+    r"|strokes?"
+    r"|blood clots?"
+    r"|heart disease"
+    r"|cardiovascular disease"
+    r"|clots?"
+    r"|further stroke"
+    r"|side effects"
+    r"|cvd"
+    r"|dizziness(?:/unsteadiness)?"
+)
+
+# Verb forms
+_REDUCE_INF = (
+    r"reduce|lower|control|manage|prevent|treat|improve|relieve|protect|aid|loosen"
+)
+_REDUCE_GER = r"reducing|lowering|controlling|managing|preventing|treating|improving|relieving|protecting|aiding|loosening"
+_RAISE_INF = r"raise|increase|improve|treat|boost"
+_RAISE_GER = r"raising|increasing|improving|treating|boosting"
+_NEUTRAL_INF = (
+    r"control|manage|treat|help|improve|relieve|protect|aid|prevent|reduce|lower"
+)
+_NEUTRAL_GER = r"controlling|managing|treating|helping|improving|relieving|protecting|aiding|preventing|reducing|lowering"
+_SITE_INF = r"help|protect|treat|support|aid|improve"
+_SITE_GER = r"helping|protecting|treating|supporting|aiding|improving"
+_PAIN_INF = r"relieve|reduce|treat|prevent|help|control|manage"
+_PAIN_GER = r"relieving|reducing|treating|preventing|helping|controlling|managing"
+
+_HIGH_Q = r"(?:your |high |raised |excess )?"
+_LOW_Q = r"(?:your (?:low )?|low )?"
+_YOUR = r"(?:your )?"
+
+for_config = [
+    # ── IMPORTANT: specific/compound patterns FIRST ───────────────────────────
+    # These must come before the broad general patterns below. Regex alternation
+    # is first-match, so "for blood pressure" would beat "for blood pressure control"
+    # if the general pattern appeared earlier. All patterns below that could be
+    # a prefix of something longer are listed here first.
+    # ── X control: bp control, bladder control, pain control etc ─────────────
+    rf"(?:to (?:help )?|for (?:help(?:ing)? )?)(?:improve|maintain|aid) {_YOUR}(?:{_CONTROL_NOUNS}) control",
+    rf"for {_YOUR}(?:{_CONTROL_NOUNS}) control",
+    # ── Risk of X ─────────────────────────────────────────────────────────────
+    rf"(?:to (?:help )?|for (?:help(?:ing)? )?)(?:reduce|lower|prevent) (?:the |your )?risk of (?:{_RISK_EVENTS})(?:(?: (?:and|or|/) (?:{_RISK_EVENTS}))?)?",
+    r"(?:to (?:help )?|for (?:help(?:ing)? )?)(?:reduce|lower|prevent) (?:the |your )?risk",
+    # ── Remaining special cases ───────────────────────────────────────────────
+    r"to reduce heart (?:strain(?:/failure)?|attacks? and strokes?|and stroke risk|effort)",
+    r"to reduce heartburn and stomach pain",
+    r"to (?:keep|regulate) (?:the )?bowels? regular",
+    r"to aid (?:improved )?sleep",
+    r"for (?:irritable )?bowel (?:spasm )?pain",
+    r"for high blood pressure control",
+    r"for high blood pressure/angina/palpitations",
+    r"to help stomach while on (?:aspirin|rivaroxaban)",
+    r"to help stomach(?: (?:acid|ache))?",
+    r"to help thyroid(?: gland)?",
+    r"for your (?:mood and sleep|neuropathic pain)",
+    r"to (?:improve|help improve) (?:blood pressure control|thyroid levels?|stomach pain|chronic fatigue)",
+    # ── High items + dual (reduce only) ──────────────────────────────────────
+    rf"(?:to (?:help )?|for (?:help(?:ing)? )?)(?:{_REDUCE_INF}) {_HIGH_Q}(?:{_HIGH_ITEMS}|{_DUAL_ITEMS})",
+    rf"to help (?:{_REDUCE_GER}) {_HIGH_Q}(?:{_HIGH_ITEMS}|{_DUAL_ITEMS})",
+    rf"for (?:{_REDUCE_GER}) {_HIGH_Q}(?:{_HIGH_ITEMS}|{_DUAL_ITEMS})",
+    rf"for {_HIGH_Q}(?:{_HIGH_ITEMS}|{_DUAL_ITEMS})",
+    # ── Low items + dual (raise only) ────────────────────────────────────────
+    rf"(?:to (?:help )?|for (?:help(?:ing)? )?)(?:{_RAISE_INF}) {_LOW_Q}(?:{_LOW_ITEMS}|{_DUAL_ITEMS})",
+    rf"to help (?:{_RAISE_GER}) {_LOW_Q}(?:{_LOW_ITEMS}|{_DUAL_ITEMS})",
+    rf"for (?:{_RAISE_GER}) {_LOW_Q}(?:{_LOW_ITEMS}|{_DUAL_ITEMS})",
+    rf"for low (?:{_LOW_ITEMS}|{_DUAL_ITEMS})",
+    rf"for {_LOW_Q}(?:{_LOW_ITEMS})",
+    # ── Condition items: neutral verbs, "your" qualifier only ─────────────────
+    rf"(?:to (?:help )?|for (?:help(?:ing)? )?)(?:{_NEUTRAL_INF}) {_YOUR}(?:{_CONDITION_ITEMS})",
+    rf"to help (?:{_NEUTRAL_GER}) {_YOUR}(?:{_CONDITION_ITEMS})",
+    rf"for (?:{_NEUTRAL_GER}) {_YOUR}(?:{_CONDITION_ITEMS})",
+    rf"for {_YOUR}(?:{_CONDITION_ITEMS})",
+    rf"to help {_YOUR}(?:{_CONDITION_ITEMS})",
+    # ── Body site nouns: "your" + restricted verbs only ───────────────────────
+    rf"(?:to (?:{_SITE_INF})|for (?:{_SITE_GER})) your (?:{_BODY_SITE_NOUNS})",
+    rf"for your (?:{_BODY_SITE_NOUNS})",
+    # ── Pain types: reduce/relieve/treat ─────────────────────────────────────
+    rf"(?:to (?:help )?|for (?:help(?:ing)? )?)(?:{_PAIN_INF}) (?:your )?(?:{_PAIN_TYPES})",
+    rf"to help (?:{_PAIN_GER}) (?:your )?(?:{_PAIN_TYPES})",
+    rf"for (?:{_PAIN_GER}) (?:your )?(?:{_PAIN_TYPES})",
+    rf"for (?:your )?(?:{_PAIN_TYPES})",
+]
+
+
+# ---------------------------------------------------------------------------
+# when_config — structured generation of timing phrases
+#
+# Timing nouns are grouped by semantic category. Each group defines which
+# prepositions and determiners are valid, based on real prescription data.
+# The flat list is generated programmatically — identical to the original
+# hand-maintained list but far easier to reason about and extend.
+#
+# Noun categories:
+#   _W_MEAL_SG         → singular generic meals (meal, main meal, evening meal)
+#   _W_MEAL_PL         → plural generic meals (meals, main meals, evening meals)
+#   _W_SPECIFIC_MEALS  → named meals (breakfast, lunch, dinner, etc.)
+#   _W_FOOD            → generic food/eating terms
+#   _W_TOD_SG          → singular time of day (morning, afternoon, evening)
+#   _W_TOD_PL          → plural time of day (mornings, afternoons, evenings)
+#   _W_NIGHT_SLEEP     → night/sleep/bedtime
+#   _W_WAKING          → waking/wakes
+#   _W_BOWEL           → bowel movement(s)
+#   _W_STOMACH         → empty stomach
+#   _W_PROCEDURE       → procedure
+# ---------------------------------------------------------------------------
+
+# ── Noun categories ──────────────────────────────────────────────────────────
+
+# Meals: singular nouns use "a" or "an" depending on vowel start
+_W_MEALS = [
+    # (singular, plural, article)
+    ("meal", "meals", "a"),
+    ("main meal", "main meals", "a"),
+    ("evening meal", "evening meals", "an"),
+    ("morning meal", None, "a"),  # no plural form in data
+    ("breakfast", "breakfasts", "a"),
+    ("lunch", None, "a"),
+    ("lunchtime", None, None),  # no article ("a lunchtime" is unusual)
+    ("dinner", None, "a"),
+    ("tea time", None, None),  # no article
+]
+
+_W_FOOD = ["food"]
+_W_TOD_SG = ["morning", "afternoon", "evening"]
+_W_TOD_PL = ["mornings", "afternoons", "evenings"]
+_W_NIGHT_SLEEP_NOUNS = ["night", "bedtime"]
+_W_WAKING = ["waking", "wakes"]
+_W_BOWEL_SG = ["bowel movement"]
+_W_BOWEL_PL = ["bowel movements"]
+
+# ── Generation rules ─────────────────────────────────────────────────────────
+
+
+def _generate_when_options():
+    """Generate all valid when timing phrases from structured rules."""
+    opts = []
+
+    # ── MEALS: before/after/with/at + [the/a|an/each/every] ──────────────
+    # All meal nouns (singular and plural) in one unified loop.
+    # For each singular noun: prep + bare, prep + the, prep + a/an, prep + each/every
+    # For each plural noun: prep + bare, with the
+    for sg, pl, article in _W_MEALS:
+        for prep in ("before", "after", "with", "at"):
+            # singular: bare + the + each/every
+            opts.append(f"{prep} {sg}")  # before meal
+            opts.append(f"{prep} the {sg}")  # before the meal
+            for det in ("each", "every"):
+                opts.append(f"{prep} {det} {sg}")  # before each meal
+            # singular: article (a/an) where valid
+            if article:
+                opts.append(
+                    f"{prep} {article} {sg}"
+                )  # before a meal / with an evening meal
+
+            # plural: bare
+            if pl:
+                opts.append(f"{prep} {pl}")  # before meals
+
+        # each/every as standalone prefix (singular only)
+        opts.append(f"each {sg}")  # each meal
+        opts.append(f"every {sg}")  # every meal
+
+        # with the + plural
+        if pl:
+            opts.append(f"with the {pl}")  # with the meals
+
+    # Extra meal variant
+    opts.append("in evening meal")  # unusual but appears in data
+
+    # ── FOOD: before/after/with + [bare/the/a] ───────────────────────────
+    for prep in ("before", "after", "with"):
+        opts.append(f"{prep} food")  # before food
+        opts.append(f"{prep} the food")  # before the food
+        opts.append(f"{prep} a food")  # after a food
+    opts.append("with foods")
+
+    # eating: before/after/with/when
+    for prep in ("before", "after", "with", "when"):
+        opts.append(f"{prep} eating")  # before eating
+
+    # ── TIME OF DAY (singular): in/at/on + [the/an/each/every/a] ──────────
+    # Rules differ slightly per noun due to article agreement and idiom:
+    #   "in an evening" ✓ but "in an morning" ✗ (consonant)
+    #   "in evening" ✓ but "in morning" ✗ (not idiomatic)
+    #   "at morning" ✓ (exists in data) but "at afternoon" ✗ (unusual)
+    for noun in _W_TOD_SG:
+        # in the — all three
+        opts.append(f"in the {noun}")
+        # on the / on each / on every — all three
+        opts.append(f"on the {noun}")
+        opts.append(f"on each {noun}")
+        opts.append(f"on every {noun}")
+        # at each / at every — all three
+        opts.append(f"at each {noun}")
+        opts.append(f"at every {noun}")
+        # each/every as prefix — all three
+        opts.append(f"each {noun}")
+        opts.append(f"every {noun}")
+        # with (unusual but in data) — all three
+        opts.append(f"with {noun}")
+
+    # "in/on + bare" and "in/on + an" only for evening (vowel, idiomatic)
+    opts.extend(["in evening", "in an evening", "on evening", "on an evening"])
+    # "in + bare" and "in an" for afternoon
+    opts.extend(["in afternoon", "in an afternoon", "on an afternoon"])
+    # "at + bare" for morning and evening (not afternoon)
+    opts.extend(["at morning", "at evening"])
+    # "on a morning" special case
+    opts.append("on a morning")
+    # before morning/evening (not afternoon)
+    opts.extend(["before morning", "before evening"])
+
+    # ── TIME OF DAY (plural): in/on + [the/bare] ────────────────────────
+    for noun in _W_TOD_PL:
+        opts.append(f"in the {noun}")
+        opts.append(f"in {noun}")
+        opts.append(f"on the {noun}")
+        opts.append(f"on {noun}")
+
+    # ── NOON ──────────────────────────────────────────────────────────────
+    opts.extend(["at noon", "before noon", "after noon", "each noon"])
+
+    # ── NIGHT / SLEEP / BEDTIME ───────────────────────────────────────────
+    # night and bedtime share: at, before, before each/every, each, every
+    for noun in ("night", "bedtime"):
+        opts.append(f"at {noun}")  # at night
+        opts.append(f"before {noun}")  # before night
+        opts.append(f"before each {noun}")  # before each bedtime
+        opts.append(f"before every {noun}")  # before every night
+        opts.append(f"each {noun}")  # each night
+        opts.append(f"every {noun}")  # every night
+        opts.append(f"with {noun}")  # with bedtime (unusual)
+        # night-specific: has "the", "on", "in the", plural
+    opts.extend(
+        [
+            "before the night",
+            "at every night",
+            "in the night",
+            "in the nights",
+            "in the bedtime",
+            "on a night",
+            "on the night",
+            "on the nights",
+            "on every night",
+            "on nights",
+        ]
+    )
+    # sleep/sleeping
+    opts.extend(["before sleep", "before sleeping", "with sleeping"])
+
+    # ── WAKING ────────────────────────────────────────────────────────────
+    opts.extend(
+        ["after waking", "on waking", "upon waking", "when waking", "when wakes"]
+    )
+
+    # ── BOWEL MOVEMENT ────────────────────────────────────────────────────
+    for prep in ("before", "after", "with"):
+        opts.append(f"{prep} bowel movement")
+        opts.append(f"{prep} each bowel movement")
+        opts.append(f"{prep} every bowel movement")
+        opts.append(f"{prep} a bowel movement")
+        opts.append(f"{prep} bowel movements")
+
+    # ── EMPTY STOMACH ─────────────────────────────────────────────────────
+    opts.extend(
+        [
+            "on an empty stomach",
+            "on empty stomach",
+            "with an empty stomach",
+            "with empty stomach",
+        ]
+    )
+
+    # ── PROCEDURE ─────────────────────────────────────────────────────────
+    opts.extend(["at procedure", "before procedure", "before the procedure"])
+
+    # ── AT ONCE prefix (immediately) ─────────────────────────────────────
+    opts.extend(
+        [
+            "at once after breakfast",
+            "at once after food",
+            "at once at lunch",
+            "at once at night",
+            "at once each morning",
+            "at once every evening",
+            "at once every morning",
+            "at once in the morning",
+            "at once with breakfast",
+            "at once with food",
+            "at once with main meal",
+            "at once with meal",
+        ]
+    )
+
+    return sorted(set(opts))
+
+
+when_config = {"options": _generate_when_options()}
+
+# ---------------------------------------------------------------------------
+# SITES — single source of truth for application site SNOMED metadata.
+#
+# Each entry maps a site keyword to (snomed_code, snomed_display, description_display).
+#   snomed_code:         SNOMED CT code
+#   snomed_display:      SNOMED display text
+#   description_display: UK SNOMED description display (for extension)
+#
+# site_config (below) handles regex pattern matching for extraction.
+# SITE_TO_SNOMED (derived) handles FHIR coding for matched sites.
+# ---------------------------------------------------------------------------
+SITES = {
+    # keyword            snomed_code        snomed_display                  description_display
+    "both eyes": ("40638003", "Structure of both eyes", "Both eyes"),
+    "left eye": ("8966001", "Left eye structure", "Left eye"),
+    "right eye": ("18944008", "Right eye structure", "Right eye"),
+    "each eye": ("81745001", "Structure of eye", "Each eye"),
+    "left nostril": ("91775001", "Structure of left nasal cavity", "Left nostril"),
+    "right nostril": ("91776000", "Structure of right nasal cavity", "Right nostril"),
+    "each nostril": ("45206002", "Nasal cavity structure", "Each nostril"),
+    "nostrils": ("45206002", "Nasal cavity structure", "Nostrils"),
+    "tongue": ("21974007", "Tongue structure", "Tongue"),
+    "rectum": ("34402009", "Rectum structure", "Rectum"),
+    "affected area": ("22201000087104", "Affected area", "Affected area"),
 }
 
-when_config = {
-    "options": [
-        "after every bowel movement",
-        "before each bowel movement",
-        "after each bowel movement",
-        "at 30minutes before food",
-        "with each bowel movement",
-        "at 2 hours before sleep",
-        "at once after breakfast",
-        "before the evening meal",
-        "after a bowel movement",
-        "after the evening meal",
-        "at once in the morning",
-        "at once with breakfast",
-        "at once with main meal",
-        "before bowel movements",
-        "each with evening meal",
-        "with each evening meal",
-        "with the evening meals",
-        "after bowel movements",
-        "after every main meal",
-        "at once every evening",
-        "at once every morning",
-        "before bowel movement",
-        "before each main meal",
-        "each in the afternoon",
-        "with an empty stomach",
-        "with the evening meal",
-        "after bowel movement",
-        "after each main meal",
-        "at once each morning",
-        "before evening meals",
-        "before the breakfast",
-        "before the main meal",
-        "before the procedure",
-        "every in the evening",
-        "every in the morning",
-        "in the empty stomach",
-        "with an evening meal",
-        "with bowel movements",
-        "with every breakfast",
-        "with every main meal",
-        "after evening meals",
-        "after the breakfast",
-        "after the main meal",
-        "at the evening meal",
-        "before each bedtime",
-        "before evening meal",
-        "each in the evening",
-        "each in the morning",
-        "each with breakfast",
-        "in an empty stomach",
-        "in the evening meal",
-        "on an empty stomach",
-        "with each main meal",
-        "with the main meals",
-        "after evening meal",
-        "at every main meal",
-        "at once after food",
-        "before a breakfast",
-        "with empty stomach",
-        "with evening meals",
-        "with every morning",
-        "with the breakfast",
-        "with the main meal",
-        "after a main meal",
-        "at once with food",
-        "at once with meal",
-        "before every meal",
-        "before main meals",
-        "each at breakfast",
-        "each at lunchtime",
-        "each evening meal",
-        "each in the night",
-        "in the afternoons",
-        "with evening meal",
-        "after every meal",
-        "after main meals",
-        "at every evening",
-        "at every morning",
-        "at once at lunch",
-        "at once at night",
-        "before breakfast",
-        "before each meal",
-        "before lunchtime",
-        "before main meal",
-        "before procedure",
-        "before the lunch",
-        "before the night",
-        "each at tea time",
-        "in the afternoon",
-        "in the breakfast",
-        "in the lunchtime",
-        "on empty stomach",
-        "on every evening",
-        "on every morning",
-        "on the afternoon",
-        "with a main meal",
-        "with the evening",
-        "with the morning",
-        "after breakfast",
-        "after each meal",
-        "after lunchtime",
-        "after main meal",
-        "at each evening",
-        "at each morning",
-        "at evening meal",
-        "before sleeping",
-        "before tea time",
-        "before the food",
-        "before the meal",
-        "every afternoon",
-        "every breakfast",
-        "every lunchtime",
-        "in an afternoon",
-        "in evening meal",
-        "in the evenings",
-        "in the mornings",
-        "on an afternoon",
-        "on each evening",
-        "on each morning",
-        "on the mornings",
-        "with breakfasts",
-        "with every meal",
-        "with main meals",
-        "after the food",
-        "after the meal",
-        "at every night",
-        "at the evening",
-        "at the morning",
-        "before bedtime",
-        "before evening",
-        "before morning",
-        "each afternoon",
-        "each breakfast",
-        "each lunchtime",
-        "each main meal",
-        "each with food",
-        "every tea time",
-        "in the bedtime",
-        "in the evening",
-        "in the morning",
-        "on every night",
-        "on the evening",
-        "on the morning",
-        "with afternoon",
-        "with breakfast",
-        "with each meal",
-        "with lunchtime",
-        "with main meal",
-        "with the meals",
-        "at each night",
-        "at main meals",
-        "before a meal",
-        "before dinner",
-        "before eating",
-        "each at lunch",
-        "each at night",
-        "each tea time",
-        "every bedtime",
-        "every evening",
-        "every morning",
-        "in an evening",
-        "in the nights",
-        "on afternoons",
-        "on an evening",
-        "on each night",
-        "on the nights",
-        "with sleeping",
-        "with tea time",
-        "with the food",
-        "with the meal",
-        "after a food",
-        "after a meal",
-        "after dinner",
-        "after eating",
-        "after waking",
-        "at afternoon",
-        "at breakfast",
-        "at each meal",
-        "at lunchtime",
-        "at main meal",
-        "at procedure",
-        "at the night",
-        "before lunch",
-        "before meals",
-        "before night",
-        "before sleep",
-        "each at noon",
-        "each bedtime",
-        "each evening",
-        "each morning",
-        "in afternoon",
-        "in the lunch",
-        "in the night",
-        "on a morning",
-        "on the night",
-        "with a lunch",
-        "with bedtime",
-        "with evening",
-        "with morning",
-        "after lunch",
-        "after meals",
-        "at tea time",
-        "before food",
-        "before meal",
-        "before noon",
-        "each dinner",
-        "every lunch",
-        "every night",
-        "in evenings",
-        "in mornings",
-        "in the noon",
-        "on evenings",
-        "on mornings",
-        "upon waking",
-        "when eating",
-        "when waking",
-        "with a food",
-        "with a meal",
-        "with dinner",
-        "with eating",
-        "after food",
-        "after meal",
-        "after noon",
-        "at bedtime",
-        "at evening",
-        "at morning",
-        "each lunch",
-        "each night",
-        "every meal",
-        "in evening",
-        "in morning",
-        "on a night",
-        "on evening",
-        "when wakes",
-        "with foods",
-        "with lunch",
-        "with meals",
-        "with night",
-        "with sleep",
-        "at a meal",
-        "at dinner",
-        "at waking",
-        "each meal",
-        "each noon",
-        "on nights",
-        "on waking",
-        "with food",
-        "with meal",
-        "at lunch",
-        "at meals",
-        "at night",
-        "at meal",
-        "at noon",
-    ]
+# ---------------------------------------------------------------------------
+# Derived from SITES
+# ---------------------------------------------------------------------------
+SITE_TO_SNOMED = {
+    k: {"code": code, "display": display, "descriptionDisplay": desc}
+    for k, (code, display, desc) in SITES.items()
 }
+
+# ---------------------------------------------------------------------------
+# EXTRAS_TO_SNOMED — SNOMED codes for additional instruction phrases.
+#
+# If an extras_clean text matches a key here, the FHIR additionalInstruction
+# gets a coded entry instead of free text.
+# ---------------------------------------------------------------------------
+EXTRAS_TO_SNOMED = {
+    "gently": {"code": "418449005", "display": "Gently"},
+    "liberally": {"code": "419125005", "display": "Liberally"},
+    "vigorously": {"code": "419913006", "display": "Vigorously"},
+    "until finished": {"code": "421984009", "display": "Until finished"},
+    "until gone": {"code": "420652005", "display": "Until gone"},
+    "then discontinue": {"code": "421484000", "display": "Then discontinue"},
+    "then stop": {"code": "422327006", "display": "Then stop"},
+    "sparingly": {"code": "420883007", "display": "Sparingly"},
+    "slowly": {"code": "419443000", "display": "Slowly"},
+    "repeatedly": {"code": "769410007", "display": "Repeatedly"},
+    "completely": {"code": "769408005", "display": "Completely"},
+    "deeply": {"code": "769409002", "display": "Deeply"},
+    "now": {"code": "421723005", "display": "Now"},
+    "once only, at night": {
+        "code": "13287601000001100",
+        "display": "Once only, at night",
+    },
+    "once only": {"code": "422114001", "display": "Once only"},
+    "only": {"code": "420295001", "display": "Only"},
+    "thoroughly": {"code": "769407000", "display": "Thoroughly"},
+    "as directed": {"code": "1116431000001106", "display": "As directed"},
+}
+
+# ---------------------------------------------------------------------------
+# SPOON_SIZE_TO_SNOMED — SNOMED codes for spoonful sizes.
+# 5ml has a UK SNOMED code; 2.5ml does not (display only).
+# ---------------------------------------------------------------------------
+SPOON_SIZE_TO_SNOMED = {
+    "5": {"code": "514941000000109", "display": "5ml spoonful"},
+    "2.5": {"code": None, "display": "2.5ml spoonful"},
+}
+
+# ---------------------------------------------------------------------------
+# site_config — regex patterns for application site extraction
+#
+# Preposition constraints per body part:
+#   eye      → in/into/to/on  (all four)
+#   nostril  → in/into/to/on  (all four)
+#   area     → in/into/to/on  (all four; "inject into the area" is valid)
+#   nail     → in/to/on       (no into)
+#   tongue   → under/on/to/into (not "in the tongue")
+#   rectum   → in/into/to     (no on/under)
+# ---------------------------------------------------------------------------
+
+_S_PREP_EYE = r"(?:in|into|to|on)"
+_S_PREP_NOS = r"(?:in|into|to|on)"
+_S_PREP_AREA = r"(?:in|into|to|on)"
+_S_PREP_NAIL = r"(?:in|to|on|under)"
+_S_PREP_RECT = r"(?:in|into|to)"
+_S_PREP_TONG = r"(?:under|on|to|into)"
+_S_ADJ = r"(?:affected |infected |painful )?"
+_S_SIDE = r"(?:left |right |both |each )?"
 
 site_config = [
-    "in the affected nostril",
-    "to the affected nostril",
-    "into affected nostrils",
-    "in the affected areas",
-    "into affected nostril",
-    "to the affected areas",
-    "to the affected nails",
-    "in the affected area",
-    "in the affected eyes",
-    "in the right nostril",
-    "to affected nostrils",
-    "to the affected area",
-    "to the affected eyes",
-    "to the affected nail",
-    "to the infected area",
-    "to the infected nail",
-    "to the painful areas",
-    "to the right nostril",
-    "in affected nostril",
-    "in the affected eye",
-    "in the left nostril",
-    "into affected areas",
-    "to affected nostril",
-    "to infected nostril",
-    "to the affected eye",
-    "to the left nostril",
-    "to the painful area",
-    "into affected area",
-    "into affected eyes",
-    "into both nostrils",
-    "into painful areas",
-    "into right nostril",
-    "affected nostrils",
-    "in affected areas",
-    "into affected eye",
-    "into each nostril",
-    "into left nostril",
-    "into painful area",
-    "into the nostrils",
-    "on affected areas",
-    "on infected areas",
-    "to affected areas",
-    "to affected nails",
-    "to infected areas",
-    "to infected nails",
-    "affected nostril",
-    "in affected area",
-    "in affected eyes",
-    "in both nostrils",
-    "in painful areas",
-    "in right nostril",
-    "in the right eye",
-    "into the nostril",
-    "on affected area",
-    "on affected eyes",
-    "on affected nail",
-    "on both nostrils",
-    "on infected area",
-    "on painful areas",
-    "to affected area",
-    "to affected eyes",
-    "to affected nail",
-    "to both nostrils",
-    "to infected area",
-    "to infected nail",
-    "to painful areas",
-    "to right nostril",
-    "to the right eye",
-    "under the tongue",
-    "in affected eye",
-    "in each nostril",
-    "in left nostril",
-    "in the left eye",
-    "into the rectum",
-    "into the tongue",
-    "on affected eye",
-    "on each nostril",
-    "on painful area",
-    "to affected eye",
-    "to each nostril",
-    "to left nostril",
-    "to painful area",
-    "to the left eye",
-    "to the nostrils",
-    "affected areas",
-    "affected nails",
-    "in the nostril",
-    "infected areas",
-    "into both eyes",
-    "into right eye",
-    "to the nostril",
-    "affected area",
-    "affected eyes",
-    "both nostrils",
-    "in the rectum",
-    "infected area",
-    "infected nail",
-    "into each eye",
-    "into left eye",
-    "into nostrils",
-    "into the area",
-    "into the eyes",
-    "on the rectum",
-    "on the tongue",
-    "painful areas",
-    "right nostril",
-    "to the rectum",
-    "to the tongue",
-    "affected eye",
-    "each nostril",
-    "in each area",
-    "in right eye",
-    "into nostril",
-    "into the eye",
-    "left nostril",
-    "on both eyes",
-    "on right eye",
-    "on the nails",
-    "painful area",
-    "the nostrils",
-    "to both eyes",
-    "to each area",
-    "to right eye",
-    "to the areas",
-    "under tongue",
-    "in each eye",
-    "in left eye",
-    "in nostrils",
-    "in the area",
-    "in the eyes",
-    "into rectum",
-    "on each eye",
-    "on left eye",
-    "on the area",
-    "the nostril",
-    "to each eye",
-    "to left eye",
-    "to nostrils",
-    "to the area",
-    "to the eyes",
-    "under nails",
-    "in nostril",
-    "in the eye",
-    "the rectum",
-    "the tongue",
-    "to nostril",
-    "to the eye",
-    "under eyes",
-    "both eyes",
-    "in rectum",
-    "into area",
-    "into eyes",
-    "on tongue",
-    "right eye",
-    "the areas",
-    "the nails",
-    "to rectum",
-    "to tongue",
-    "each eye",
-    "in areas",
-    "in nails",
-    "into eye",
-    "left eye",
-    "nostrils",
-    "on nails",
-    "the area",
-    "the eyes",
-    "the nail",
-    "to areas",
-    "to nails",
-    "in area",
-    "in eyes",
-    "nostril",
-    "on area",
-    "on nail",
-    "the eye",
-    "to area",
-    "to eyes",
-    "to nail",
-    "in eye",
-    "on eye",
-    "rectum",
-    "to eye",
-    "tongue",
-    "areas",
-    "nails",
-    "area",
-    "eyes",
-    "nail",
-    "eye",
+    # eye — in/into/to/on, optional side or determiner
+    rf"{_S_PREP_EYE}(?: the)? {_S_ADJ}{_S_SIDE}eyes?",
+    # nostril — in/into/to/on, optional side or determiner
+    rf"{_S_PREP_NOS}(?: the)? {_S_ADJ}{_S_SIDE}nostrils?",
+    # area — in/into/to/on, optional determiner
+    rf"{_S_PREP_AREA}(?: (?:the|each|an))? {_S_ADJ}areas?",
+    # nail — in/to/on/under (no into)
+    rf"{_S_PREP_NAIL}(?: the)? {_S_ADJ}nails?",
+    # tongue — under/on/to/into (not "in")
+    rf"{_S_PREP_TONG}(?: the)? tongue",
+    # rectum — in/into/to (no on/under)
+    rf"{_S_PREP_RECT}(?: the)? rectum",
+    # bare entries — adjective/side without preposition
+    rf"{_S_ADJ}{_S_SIDE}eyes?",
+    rf"{_S_ADJ}{_S_SIDE}nostrils?",
+    rf"{_S_ADJ}areas?",
+    rf"{_S_ADJ}nails?",
+    r"tongue",
+    r"rectum",
 ]
 
 # ---------------------------------------------------------------------------
@@ -2254,6 +1529,10 @@ PRIORITY_EXCEPTIONS = {
         "methodPassive",
         "whenWithMethod",
     ): "method extracted first, rescue gives compound the span",
+    (
+        "methodDirect",
+        "doseQuantity",
+    ): "dual-purpose words (spray/suck): method wins initially, rescue prefers doseQuantity when preceded by number",
 }
 
 ISOLATED_ELEMENTS = {loser for _, loser in PRIORITY_EXCEPTIONS}
@@ -2493,7 +1772,9 @@ VALIDATION_GROUPS = {
             ],
         },
         "max_rules": {
-            "milligramMax_valueMax": ("must_be_greater_than", "milligramMax_value"),
+            # Note: must_be_greater_than for milligramMax_valueMax is handled by
+            # rule_milligram_range_consistency in cross_column_validity_rules.py, which accounts
+            # for cross-unit ranges (e.g. 500mg to 1g where raw 1 < 500 but 1g > 500mg).
             "milligramMax_value": ("avoid_zero", False),
         },
     },
@@ -2556,3 +1837,269 @@ def _build_rules_from_groups(groups):
 
 
 NUMERIC_VALIDATION_RULES = _build_rules_from_groups(VALIDATION_GROUPS)
+
+
+# ---------------------------------------------------------------------------
+# Implied frequency rule — single source of truth
+#
+# When no explicit frequency count is stated (no frequencyBare / frequencyWithMethod),
+# the model assumes frequency=1. This assumption is applied in two places:
+#
+#   1. PeriodElement.phrase_parts() — for period words ("each day", "per week", etc.)
+#      The spaCy matcher captures the period and hardcodes frequency=IMPLIED_FREQUENCY.
+#
+#   2. _infer_period_for_daily_when() in matcher_run.py — for daily timing words
+#      ("each morning", "every night", etc.) captured by WhenBare/WhenWithMethod.
+#      Post-spaCy Spark SQL creates a synthetic periodElement with frequency,
+#      period, and periodUnit all set from these constants.
+#      This can't be done inside the spaCy UDF because WhenBare would need to
+#      check whether PeriodElement/Frequency elements were already resolved —
+#      cross-element logic belongs in the post-processing layer, not inside
+#      individual element classes.
+#
+# The assumption is only safe when dose == IMPLIED_ONLY_IF_DOSE. This is
+# validated by CC12 (rule_cc12_period_without_single_dose) in
+# cross_column_validity_rules.py.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Row selection threshold — minimum dosage_count to include a dosage_lower
+# group in the extraction pipeline. Set to None to disable filtering.
+# ---------------------------------------------------------------------------
+MIN_COUNT = 10000
+
+# ---------------------------------------------------------------------------
+# Assumptions:
+# If each day is said, and dose = 1 then frequency of once is implied
+# If each morning (or other specific time of day) is said, and dose = 1
+# then period and frequency of once every day is implied
+# ---------------------------------------------------------------------------
+IMPLIED_FREQUENCY = "1"
+IMPLIED_DAILY_PERIOD = "1"
+IMPLIED_DAILY_UNIT = "day"
+IMPLIED_ONLY_IF_DOSE = 1
+
+# ---------------------------------------------------------------------------
+# Pipeline constants — used by matcher_run.py
+# ---------------------------------------------------------------------------
+
+# Regex matching "each/every" + a daily timing word. Used by
+# _infer_period_for_daily_when() to detect when elements that imply
+# a daily period. See "Implied frequency rule" above.
+DAILY_WHEN_RE = (
+    r"^(each|every)\s+(morning|afternoon|evening|night|bedtime|noon|waking)$"
+)
+
+# Normalisation rules for when text → canonical FHIR timing form.
+# Multiple phrasings map to the same FHIR EventTiming code (e.g. "in the morning",
+# "at morning", "on a morning" all → MORN). Order matters: longer/more-specific
+# keywords first to avoid partial matches (e.g. "bedtime" before "night").
+# Phrases containing "meal" are excluded — they retain original specificity.
+WHEN_NORMALISE_RULES = [
+    (r".*\bbedtime\b.*", "at bedtime"),
+    (r".*\bwaking\b.*", "on waking"),
+    (r"^at noon$", "at noon"),
+    (r".*\bmorning\b(?!.*meal).*", "in the morning"),
+    (r".*\bafternoon\b.*", "in the afternoon"),
+    (r".*\bevening\b(?!.*meal).*", "in the evening"),
+    (r".*\bnight\b.*", "at night"),
+]
+
+# ---------------------------------------------------------------------------
+# asNeededBoolean — all phrase forms that express "as needed" in prescriptions.
+# "as needed" is the canonical form; all others are synonyms normalised to it.
+# Used as:
+#   - matcher patterns for asNeededBoolean_clean and asNeededCodeableConcept_clean
+#   - ASNEEDED_NORMALISE_PATTERN  — normalises synonyms → "as needed" in _clean
+#   - ASNEEDED_STRIP_PATTERN      — strips the prefix from ANCC_clean leaving
+#                                   just the indication (e.g. "for pain")
+# ---------------------------------------------------------------------------
+asNeededBoolean = [
+    "as needed",  # canonical form — normalise target, not stripped
+    "as required",
+    "when required",
+    "if required",
+    "if needed",
+    "when needed",
+    "as necessary",
+    "if necessary",
+    "when necessary",
+    # "as req",  # removed — could mean "requested"
+    # "when req",  # removed — could mean "requested"
+    # "if req",  # removed — could mean "requested"
+]
+
+# Synonyms only (excludes "as needed" itself) — used to normalise _clean to canonical.
+_AS_NEEDED_SYNONYMS = [s for s in asNeededBoolean if s != "as needed"]
+ASNEEDED_NORMALISE_PATTERN = r"(?i)\b(?:{})\b".format(
+    "|".join(re.escape(s) for s in _AS_NEEDED_SYNONYMS)
+)
+
+# Strip pattern — removes the entire asNeeded prefix (including canonical "as needed")
+# from asNeededCodeableConcept_clean, leaving just the indication phrase.
+ASNEEDED_STRIP_PATTERN = r"(?i)^(?:{}) ".format(
+    "|".join(re.escape(s) for s in asNeededBoolean)
+)
+
+# ---------------------------------------------------------------------------
+# INDICATIONS — single source of truth for indication/purpose SNOMED metadata.
+#
+# Maps the normalised indication phrase (as it appears in asNeededCodeableConcept_clean
+# or forElement_clean after stripping the asNeeded prefix) to (snomed_code, snomed_display).
+# Keys use the simplest form that will be substring-matched — longer/more-specific
+# keys are checked first (sort by length descending in INDICATION_TO_SNOMED derivation).
+#
+# Lookup strategy (same pattern as _build_route / _build_site):
+#   - Iterate INDICATION_TO_SNOMED longest-key-first
+#   - Return first key that is a substring of the lowercased indication text
+#   - Fall back to {"text": indication_text} if no match
+#
+# Codes use SNOMED CT International Edition unless marked †UK (UK extension).
+# ---------------------------------------------------------------------------
+INDICATIONS = {
+    # ── Pain ──────────────────────────────────────────────────────────────────
+    # More-specific pain types first so they win over bare "pain"
+    "neuropathic pain": ("57676002", "Neuropathic pain"),
+    "nerve-related pain": ("57676002", "Neuropathic pain"),
+    "nerve related pain": ("57676002", "Neuropathic pain"),
+    "muscle spasm": ("45352006", "Spasm"),
+    "muscle pain": ("68962001", "Myalgia"),
+    "breakthrough pain": ("22253000", "Pain"),  # no finer SNOMED code in common use
+    "chronic pain": ("82423001", "Chronic pain"),
+    "severe pain": ("22253000", "Pain"),
+    "chest pain": ("29857009", "Chest pain"),
+    "back pain": ("161891005", "Back pain"),
+    "joint pain": ("57676002", "Joint pain"),
+    "stomach pain": ("21522001", "Stomach pain"),
+    "bowel spasm pain": ("21522001", "Stomach pain"),
+    "pain relief": ("22253000", "Pain"),
+    "pain": ("22253000", "Pain"),
+    # ── Cardiovascular ────────────────────────────────────────────────────────
+    "high blood pressure/angina/palpitations": (
+        "38341003",
+        "Hypertension",
+    ),  # combined phrase → lead concept
+    "high blood pressure control": ("38341003", "Hypertension"),
+    "high blood pressure": ("38341003", "Hypertension"),
+    "blood pressure control": ("24184005", "Blood pressure finding"),
+    "blood pressure": ("24184005", "Blood pressure finding"),
+    "cardiovascular risk": ("395112001", "Cardiovascular disease risk"),
+    "cardiovascular disease": ("49601007", "Cardiovascular disease"),
+    "cvd risk": ("395112001", "Cardiovascular disease risk"),
+    "cardiovascular": ("49601007", "Cardiovascular disease"),
+    "cvd": ("49601007", "Cardiovascular disease"),
+    "heart failure": ("84114007", "Heart failure"),
+    "heart attack": ("22298006", "Myocardial infarction"),
+    "heart disease": ("56265001", "Heart disease"),
+    "heart strain": ("84114007", "Heart failure"),
+    "heart": ("56265001", "Heart disease"),
+    "angina": ("194828000", "Angina"),
+    "palpitation": ("80313002", "Palpitation"),
+    "palpitations": ("80313002", "Palpitation"),
+    "high heart rate": ("3424008", "Tachycardia"),
+    "heart rate": ("364075005", "Heart rate"),
+    "blood clot": ("396275006", "Blood clot"),
+    "blood clots": ("396275006", "Blood clot"),
+    "stroke": ("230690007", "Stroke"),
+    "further stroke": ("230690007", "Stroke"),
+    # ── Metabolic / endocrine ─────────────────────────────────────────────────
+    "high cholesterol": ("13644009", "Hypercholesterolaemia"),
+    "raised cholesterol": ("13644009", "Hypercholesterolaemia"),
+    "cholesterol control": ("13644009", "Hypercholesterolaemia"),
+    "cholesterol": ("13644009", "Hypercholesterolaemia"),
+    "high blood sugar": ("80394007", "Hyperglycaemia"),
+    "blood sugar": ("33747003", "Blood glucose"),
+    "sugar levels": ("33747003", "Blood glucose"),
+    "sugar": ("33747003", "Blood glucose"),
+    "bp control": ("24184005", "Blood pressure finding"),
+    "bp": ("24184005", "Blood pressure finding"),
+    "diabetes": ("73211009", "Diabetes mellitus"),
+    "thyroid levels": ("14304000", "Thyroid disorder"),
+    "thyroid": ("14304000", "Thyroid disorder"),
+    "vitamin d": ("34713006", "Vitamin D deficiency"),
+    "vitamin b12": ("444683003", "Vitamin B12 deficiency"),
+    "folic acid": ("190634004", "Folic acid deficiency"),
+    "folate": ("190634004", "Folic acid deficiency"),
+    "iron levels": ("35240004", "Iron deficiency"),
+    "iron": ("35240004", "Iron deficiency"),
+    "anaemia": ("271737000", "Anaemia"),
+    "gout": ("90560007", "Gout"),
+    "osteoporosis": ("64859006", "Osteoporosis"),
+    "deficiency": ("260372006", "Deficiency"),
+    # ── Respiratory ───────────────────────────────────────────────────────────
+    "breathlessness": ("230145002", "Difficulty breathing"),
+    "copd": ("13645005", "COPD"),
+    "wheeze": ("56018004", "Wheezing"),
+    "sputum": ("45710003", "Sputum"),
+    "mucus": ("405777007", "Mucus"),
+    # ── GI / abdominal ────────────────────────────────────────────────────────
+    "stomach acid": ("73550003", "Gastric acid"),
+    "stomach": ("21522001", "Stomach pain"),
+    "heartburn": ("16331000", "Heartburn"),
+    "indigestion": ("27822002", "Indigestion"),
+    "constipation": ("14760008", "Constipation"),
+    "nausea": ("422587007", "Nausea"),
+    "irritable bowel syndrome": ("10743008", "Irritable bowel syndrome"),
+    "irritable bowel": ("10743008", "Irritable bowel syndrome"),
+    "bowel spasm": ("45352006", "Spasm"),
+    "bowel syndrome": ("10743008", "Irritable bowel syndrome"),
+    "bowel symptoms": ("21522001", "Stomach pain"),
+    "bowel": ("71854001", "Bowel"),
+    "ulcer": ("13200003", "Peptic ulcer"),
+    # ── Urological ────────────────────────────────────────────────────────────
+    "incontinence": ("165232002", "Incontinence"),
+    "bladder control": ("165232002", "Incontinence"),
+    "bladder": ("57773001", "Bladder"),
+    "prostate": ("41216001", "Prostate"),
+    # ── Musculoskeletal ───────────────────────────────────────────────────────
+    "spasm": ("45352006", "Spasm"),
+    "fracture": ("125605004", "Fracture"),
+    "fractures": ("125605004", "Fracture"),
+    # ── Mental health / neurology ─────────────────────────────────────────────
+    "anxiety": ("48694002", "Anxiety"),
+    "mood and sleep": ("366979004", "Low mood"),  # combined phrase
+    "mood": ("366979004", "Low mood"),
+    "insomnia": ("193462001", "Insomnia"),
+    "sleep": ("193462001", "Insomnia"),
+    "chronic migraine": ("37796009", "Migraine"),
+    "chronic fatigue": ("52702003", "Chronic fatigue syndrome"),
+    "chronic urticaria": ("400228002", "Urticaria"),
+    "chronic rhinitis": ("40122008", "Rhinitis"),
+    "dizziness": ("404640003", "Dizziness"),
+    # ── Immunological / dermatological ────────────────────────────────────────
+    "allergies": ("408439002", "Allergy"),
+    "allergy": ("408439002", "Allergy"),
+    "irritable skin": ("418290006", "Itch"),
+    "dry eyes": ("46742003", "Dry eye syndrome"),
+    # ── Infection ─────────────────────────────────────────────────────────────
+    "infections": ("40733004", "Infection"),
+    "infection": ("40733004", "Infection"),
+    # ── Risk reduction (generic) ──────────────────────────────────────────────
+    "risk of heart attack": ("22298006", "Myocardial infarction"),
+    "risk of stroke": ("230690007", "Stroke"),
+    "risk of blood clots": ("396275006", "Blood clot"),
+    "risk of cardiovascular disease": ("49601007", "Cardiovascular disease"),
+    "risk of heart disease": ("56265001", "Heart disease"),
+    "risk of cvd": ("49601007", "Cardiovascular disease"),
+    "risk of dizziness": ("404640003", "Dizziness"),
+    "risk of side effects": (None, None),  # too generic for a code
+    "risk": (None, None),  # bare "risk" — fall through to text
+    # ── Miscellaneous ─────────────────────────────────────────────────────────
+    "disease": (None, None),  # too generic
+    "clots": ("396275006", "Blood clot"),
+    "prophylaxis": ("169443000", "Prophylaxis"),
+}
+
+# ---------------------------------------------------------------------------
+# Derived from INDICATIONS — sorted longest-key-first so substring matching
+# is greedy (e.g. "neuropathic pain" wins over "pain", "high blood pressure"
+# wins over "blood pressure").
+# ---------------------------------------------------------------------------
+INDICATION_TO_SNOMED = {
+    k: {"code": code, "display": display}
+    for k, (code, display) in sorted(
+        INDICATIONS.items(), key=lambda kv: len(kv[0]), reverse=True
+    )
+    if code is not None
+}

@@ -9,7 +9,7 @@ import pytest
 from pyspark.sql.functions import col, lower
 
 from dosage_instructions.model.matcher_run import run_extraction_pipeline
-from dosage_instructions.model.matcher_classes import classes
+from dosage_instructions.model.matcher_classes import element_types
 
 BLACKLISTED_TERMS = [
     "£",
@@ -23,7 +23,7 @@ BLACKLISTED_TERMS = [
     "tabet",
 ]
 
-ELEMENT_KEYS = [cls.element_key for cls in classes]
+ELEMENT_KEYS = [et.element_key for et in element_types]
 
 
 @pytest.fixture(scope="module")

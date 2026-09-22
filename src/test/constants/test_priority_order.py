@@ -1,9 +1,9 @@
 """
 Priority order validation test.
 
-Detects which element classes have overlapping patterns (i.e. both match
+Detects which element types have overlapping patterns (i.e. both match
 the same tokens on a probe phrase) and validates that the priority order
-in the `classes` list resolves them correctly.
+in the ``element_types`` list resolves them correctly.
 
 Normal case: the element matching the LONGER span has higher priority (wins).
 This is auto-validated — no manual declaration needed.
@@ -16,14 +16,14 @@ PRIORITY_EXCEPTIONS in constants.
 import pytest
 
 from dosage_instructions.to_test import element_specific
-from dosage_instructions.model.matcher_classes import classes
+from dosage_instructions.model.matcher_classes import element_types
 from dosage_instructions.model.constants import PRIORITY_EXCEPTIONS
 
 
 def test_priority_order_is_correct(nlp, matcher, all_instances, priority_map):
     """
     For each probe phrase from to_test.py, run the raw matcher and find all
-    classes whose patterns fire. If two classes overlap on the same tokens,
+    element types whose patterns fire. If two types overlap on the same tokens,
     verify the priority resolves correctly:
       - Longer span should have higher priority (auto-validated)
       - If shorter span has higher priority, it must be in PRIORITY_EXCEPTIONS
@@ -42,9 +42,9 @@ def test_priority_order_is_correct(nlp, matcher, all_instances, priority_map):
         class_spans = {}
         for match_id, start, end in matches:
             label = doc.vocab.strings[match_id]
-            for inst in all_instances:
-                if label.startswith(f"{inst.element_key}_"):
-                    class_spans.setdefault(inst.element_key, []).append((start, end))
+            for element in all_instances:
+                if label.startswith(f"{element.element_key}_"):
+                    class_spans.setdefault(element.element_key, []).append((start, end))
                     break
 
         keys = list(class_spans.keys())

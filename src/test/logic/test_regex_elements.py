@@ -16,17 +16,24 @@ from dosage_instructions.model.constants import (
     site_config,
     asNeededBoolean,
     extras,
+    extras_asDirected,
     extrasPAUSE,
     extrasALTER,
     extras_b,
-    odd_spellings,
+    for_config,
 )
-from dosage_instructions.model.functions import get_all_combinations
+
+# asNeededCodeableConcept patterns are the cross-product of asNeededBoolean × for_config,
+# exactly as built in matcher_run._extract_regex_elements.
+_asNeededCC = [aNB + " " + forE for forE in for_config for aNB in asNeededBoolean]
 
 REGEX_ELEMENTS = {
     "route": route,
     "asNeededBoolean": asNeededBoolean,
+    "asNeededCodeableConcept": _asNeededCC,
+    "forElement": for_config,
     "extras": extras,
+    "extrasAsDirected": extras_asDirected,
     "extrasALTER": extrasALTER,
     "extrasPAUSE": extrasPAUSE,
     "extras_b": extras_b,
@@ -98,27 +105,21 @@ def collect_regex_partial_cases():
 def test_regex_element_captures(pattern, input_text, expected):
     """Regex pattern should match and extract the expected substring."""
     match = re.search(pattern, input_text)
-    assert match is not None, (
-        f"\n  Input:    '{input_text}'"
-        f"\n  Expected: '{expected}'"
-        f"\n  Got:      no match"
-    )
-    assert match.group(0) == expected, (
-        f"\n  Input:    '{input_text}'"
-        f"\n  Expected: '{expected}'"
-        f"\n  Got:      '{match.group(0)}'"
-    )
+    assert (
+        match is not None
+    ), f"\n  Input:    '{input_text}'\n  Expected: '{expected}'\n  Got:      no match"
+    assert (
+        match.group(0) == expected
+    ), f"\n  Input:    '{input_text}'\n  Expected: '{expected}'\n  Got:      '{match.group(0)}'"
 
 
 @pytest.mark.parametrize("pattern,input_text", collect_regex_ignore_cases())
 def test_regex_element_ignores(pattern, input_text):
     """Regex pattern should NOT match this input."""
     match = re.search(pattern, input_text)
-    assert match is None, (
-        f"\n  Input:    '{input_text}'"
-        f"\n  Expected: no match"
-        f"\n  Got:      '{match.group(0)}'"
-    )
+    assert (
+        match is None
+    ), f"\n  Input:    '{input_text}'\n  Expected: no match\n  Got:      '{match.group(0)}'"
 
 
 @pytest.mark.parametrize(
@@ -127,19 +128,16 @@ def test_regex_element_ignores(pattern, input_text):
 def test_regex_element_partial(pattern, input_text, not_captured, captured):
     """Regex captures part of the input; the rest is left over."""
     match = re.search(pattern, input_text)
-    assert match is not None, (
-        f"\n  Input:    '{input_text}'"
-        f"\n  Expected captured: '{captured}'"
-        f"\n  Got:      no match"
-    )
-    assert match.group(0) == captured, (
-        f"\n  Input:    '{input_text}'"
-        f"\n  Expected captured: '{captured}'"
-        f"\n  Got captured:      '{match.group(0)}'"
-    )
+    assert (
+        match is not None
+    ), f"\n  Input:    '{input_text}'\n  Expected captured: '{captured}'\n  Got:      no match"
+    assert (
+        match.group(0) == captured
+    ), f"\n  Input:    '{input_text}'\n  Expected captured: '{captured}'\n  Got captured:      '{match.group(0)}'"
     remainder = (input_text[: match.start()] + input_text[match.end() :]).strip()
-    assert remainder == not_captured, (
-        f"\n  Input:    '{input_text}'"
-        f"\n  Expected spare: '{not_captured}'"
-        f"\n  Got spare:      '{remainder}'"
-    )
+    # Normalise multiple spaces — removing a mid-word match leaves a double space
+    # which the real pipeline also normalises away.
+    remainder = re.sub(r" {2,}", " ", remainder)
+    assert (
+        remainder == not_captured
+    ), f"\n  Input:    '{input_text}'\n  Expected spare: '{not_captured}'\n  Got spare:      '{remainder}'"

@@ -55,8 +55,7 @@ def test_buckets_capture(input_text, expected_buckets, capture_results):
     row = capture_results.get(input_text)
     if row is None:
         pytest.fail(
-            f"\n  Input '{input_text}' not found in pipeline output. "
-            f"Preprocessing may have changed dosage_lower."
+            f"\n  Input '{input_text}' not found in pipeline output. Preprocessing may have changed dosage_lower."
         )
     if row["buckets"] != expected_buckets:
         from dosage_instructions.model.constants import bucket_order
@@ -85,10 +84,9 @@ def test_buckets_exclude(input_text, exclude_results):
     row = exclude_results.get(input_text)
     if row is None:
         pytest.fail(
-            f"\n  Input '{input_text}' not found in pipeline output. "
-            f"Preprocessing may have changed dosage_lower."
+            f"\n  Input '{input_text}' not found in pipeline output. Preprocessing may have changed dosage_lower."
         )
-    if row["mapped"] is not False and row["exclude"] is None:
+    if row["mapped"] is not False:
         from dosage_instructions.model.constants import bucket_order
 
         elements_found = []
@@ -103,7 +101,7 @@ def test_buckets_exclude(input_text, exclude_results):
         elements_str = "\n".join(elements_found) if elements_found else "    (none)"
         assert False, (
             f"\n  Input:    '{input_text}'"
-            f"\n  Expected: mapped=False or exclude is set"
+            f"\n  Expected: mapped=False"
             f"\n  Got:      mapped={row['mapped']}, exclude={row['exclude']}"
             f"\n  Buckets:  '{row['buckets']}'"
             f"\n  Elements matched:\n{elements_str}"
@@ -163,6 +161,46 @@ class TestFullyMappedInput:
     def test_dosage_spare_is_empty(self, result_row):
         spare = result_row["dosage_spare"]
         assert spare is None or spare.strip() == ""
+
+
+class TestFrequencyWithMethodDoesNotDuplicateIntoFrequencyBare:
+    """
+    Regression test for: when methodDirect + methodPassive + frequencyWithMethod
+    all fire on the same input, the rescue logic that promotes frequencyWithMethod
+    must also evict frequencyBare if it snuck in before the rescue ran.
+
+    Input: 'Take HALF a tablet To be taken Three Times Daily'
+    Expected: frequencyWithMethod wins, frequencyBare_clean is None,
+              buckets shows frequency only once.
+    """
+
+    @pytest.fixture(scope="class")
+    def result_row(self, spark):
+        df = spark.createDataFrame(
+            [("Take HALF a tablet To be taken Three Times Daily",)],
+            ["dosage"],
+        )
+        result = run_extraction_pipeline(df)
+        return result.collect()[0]
+
+    def test_buckets_no_duplicate_frequency(self, result_row):
+        buckets = result_row["buckets"]
+        # frequency phrase should appear exactly once
+        assert (
+            buckets.count("times per day") == 1
+        ), f"Expected frequency to appear once in buckets, got: '{buckets}'"
+
+    def test_frequency_with_method_is_set(self, result_row):
+        assert result_row["frequencyWithMethod_clean"] is not None
+
+    def test_frequency_bare_is_none(self, result_row):
+        assert result_row["frequencyBare_clean"] is None, (
+            f"frequencyBare_clean should be None when frequencyWithMethod wins, "
+            f"got: '{result_row['frequencyBare_clean']}'"
+        )
+
+    def test_correct_buckets(self, result_row):
+        assert result_row["buckets"] == "take | 0.5 tablet | 3 times per day"
 
 
 class TestEmptyInput:

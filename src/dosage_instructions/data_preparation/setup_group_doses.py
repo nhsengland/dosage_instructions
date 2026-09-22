@@ -2,7 +2,7 @@ from transforms.api import transform_df, Input, Output, configure
 
 from pyspark.sql import DataFrame
 
-from dosage_instructions.data_preparation.functions import group_doses
+import dosage_instructions.data_preparation.functions as my_prep_functions
 
 
 @configure(["DRIVER_MEMORY_LARGE", "EXECUTOR_MEMORY_LARGE", "NUM_EXECUTORS_64"])
@@ -13,4 +13,4 @@ from dosage_instructions.data_preparation.functions import group_doses
     ),
 )
 def compute(original_records: DataFrame) -> DataFrame:
-    return group_doses(original_records)
+    return my_prep_functions.group_doses(original_records)

@@ -15,7 +15,6 @@ import pytest
 
 from dosage_instructions.model.preprocessing import (
     preprocess_dosage,
-    convert_words_to_digits,
     replace_preprocess,
     exclude_rows,
     add_dots_to_latin,
@@ -215,16 +214,22 @@ class TestLatinExpansionDataDriven:
 
 
 class TestWordsToDigitsDataDriven:
-    """Word-to-digit conversion step."""
+    """Word-to-digit conversion step (via Spark replace_preprocess)."""
 
     @pytest.mark.parametrize(
         "input_text,expected",
         list(preprocess_tests["words_to_digits"].items()),
         ids=list(preprocess_tests["words_to_digits"].keys()),
     )
-    def test_words_to_digits(self, input_text, expected):
-        result = convert_words_to_digits(input_text)
-        assert result.strip() == expected
+    def test_words_to_digits(self, spark, input_text, expected):
+        from pyspark.sql.functions import lower, col as col_
+        from dosage_instructions.model.constants import WORD_TO_DIGIT
+
+        df = spark.createDataFrame([(input_text,)], ["dosage"])
+        df = df.withColumn("dosage_lower", lower(col_("dosage")))
+        df = replace_preprocess(WORD_TO_DIGIT, df, "dosage_lower")
+        result = df.collect()[0]
+        assert result["dosage_lower"].strip() == expected
 
 
 class TestIsolatedTermsDataDriven:

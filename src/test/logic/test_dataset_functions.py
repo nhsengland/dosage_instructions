@@ -2,9 +2,7 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import Row
 
-# Assume your function is named group_and_count_dosage
 from dosage_instructions.data_preparation.functions import group_doses
-from dosage_instructions.model.config import config
 
 
 @pytest.fixture(scope="session")
@@ -28,10 +26,7 @@ def test_setup_group_doses(spark):
 
     # Assert: Collect results and verify
     result = result_df.collect()
-    # Convert to dict for easy checking
-    result_dict = {
-        row[config["dosage_col_name"]]: row["dosage_count"] for row in result
-    }
+    result_dict = {row["dosage"]: row["dosage_count"] for row in result}
 
     # Expected counts
     assert result_dict["Take twice daily"] == 3

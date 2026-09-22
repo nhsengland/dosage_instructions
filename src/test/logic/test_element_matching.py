@@ -85,15 +85,15 @@ def collect_partial_cases():
 def _run_isolated(elem_key, input_text, nlp):
     """Run extraction with only the target element registered (no priority conflicts)."""
     from spacy.matcher import Matcher as SpacyMatcher
-    from dosage_instructions.model.matcher_classes import classes
+    from dosage_instructions.model.matcher_classes import element_types
 
     iso_matcher = SpacyMatcher(nlp.vocab)
-    cls = next(c for c in classes if c.element_key == elem_key)
-    inst = cls(nlp, iso_matcher)
-    instances = [inst]
-    by_key = {inst.element_key: inst}
-    pri = {inst.element_key: 0}
-    return _extract_single_row(input_text, instances, by_key, pri, nlp, iso_matcher)
+    element_type = next(et for et in element_types if et.element_key == elem_key)
+    element = element_type(nlp, iso_matcher)
+    elements = [element]
+    by_key = {element.element_key: element}
+    pri = {element.element_key: 0}
+    return _extract_single_row(input_text, elements, by_key, pri, nlp, iso_matcher)
 
 
 def _run_full(
@@ -133,12 +133,9 @@ def test_element_captures(
             matcher,
         )
     actual = result[f"{elem_key}_clean"]
-    assert actual == expected, (
-        f"\n  Element:  {elem_key}"
-        f"\n  Input:    '{input_text}'"
-        f"\n  Expected: '{expected}'"
-        f"\n  Got:      '{actual}'"
-    )
+    assert (
+        actual == expected
+    ), f"\n  Element:  {elem_key}\n  Input:    '{input_text}'\n  Expected: '{expected}'\n  Got:      '{actual}'"
 
 
 @pytest.mark.parametrize("elem_key,input_text", collect_ignore_cases())
@@ -159,12 +156,9 @@ def test_element_ignores(
             matcher,
         )
     actual = result[f"{elem_key}_clean"]
-    assert actual is None, (
-        f"\n  Element:  {elem_key}"
-        f"\n  Input:    '{input_text}'"
-        f"\n  Expected: None (no match)"
-        f"\n  Got:      '{actual}'"
-    )
+    assert (
+        actual is None
+    ), f"\n  Element:  {elem_key}\n  Input:    '{input_text}'\n  Expected: None (no match)\n  Got:      '{actual}'"
 
 
 @pytest.mark.parametrize(

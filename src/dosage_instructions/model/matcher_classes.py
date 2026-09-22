@@ -2,7 +2,8 @@ import re as _re
 from abc import ABC, abstractmethod
 
 import pandas as pd
-from pyspark.sql.functions import pandas_udf, col as col_
+from pyspark.sql import functions as F
+from pyspark.sql.functions import pandas_udf
 from pyspark.sql.types import (
     ArrayType,
     LongType,
@@ -13,6 +14,28 @@ from pyspark.sql.types import (
 )
 
 from dosage_instructions.model import constants as myconstants
+
+# ---------------------------------------------------------------------------
+# (s) resolution — convert "tablet(s)" to "tablet" or "tablets" based on qty
+# ---------------------------------------------------------------------------
+
+
+def _resolve_parenthetical_s(unit: str, quantity: str) -> str:
+    """Resolve a '(s)' unit to singular or plural based on quantity.
+
+    E.g. "tablet(s)" + "1" → "tablet"; "tablet(s)" + "2" → "tablets".
+    If the unit doesn't contain '(s)', returns it unchanged.
+    """
+    if "(s)" not in unit:
+        return unit
+    try:
+        qty = float(quantity)
+    except (ValueError, TypeError):
+        qty = 1  # default to singular if quantity is unparseable
+    if qty == 1:
+        return myconstants.PARENTHETICAL_S_SINGULAR.get(unit, unit.replace("(s)", ""))
+    else:
+        return myconstants.PARENTHETICAL_S_PLURAL.get(unit, unit.replace("(s)", "s"))
 
 
 class BaseElement(ABC):
@@ -110,7 +133,7 @@ class BaseElement(ABC):
         """
         Register a pattern that supports both single-word and multi-word options.
 
-        For single-word options, registers one pattern with {"LEMMA": {"IN": [...]}}
+        For single-word options, registers one pattern with {"NORM": {"IN": [...]}}
         at the end. For each multi-word option (e.g. "evening meal"), registers a
         separate pattern with individual token dicts appended.
 
@@ -128,7 +151,7 @@ class BaseElement(ABC):
 
         if single_opts:
             self.meta_creator(pattern_name)
-            pattern = base_tokens + [{"LEMMA": {"IN": single_opts}}]
+            pattern = base_tokens + [{"NORM": {"IN": single_opts}}]
             self.matcher.add(f"{self.element_key}_{pattern_name}", [pattern])
             self.metadata[f"{self.element_key}_{pattern_name}"] = metadata
 
@@ -139,7 +162,7 @@ class BaseElement(ABC):
             doc = self.nlp(" ".join(words))
             for token in doc:
                 if token.pos_ == "NOUN":
-                    pattern.append({"LEMMA": token.lemma_})
+                    pattern.append({"NORM": token.lemma_})
                 else:
                     pattern.append({"LOWER": token.lower_})
             self.matcher.add(f"{self.element_key}_{mw_name}", [pattern])
@@ -182,29 +205,50 @@ class MethodDirectElement(BaseElement):
         self.pattern = []
         self.pattern.append(
             [{"LOWER": "to", "OP": "?"}, {"TEXT": {"IN": self.options}}]
-            # TODO maybe re-add "TAG": "VB" if benefit somewhere @ risk of some being missed
-            # e.g. "every day take 1" may tag this as a NN noun
         )
-        """
-        Captures:
-            to take
-            take
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "verb": -1,
         }
 
+        # Compound method patterns — multi-token phrases captured as a single method.
+        # These are registered with higher token count so they win over single-word
+        # pattern1 matches via the longest-match resolution in _extract_single_row.
+        for i, compound in enumerate(
+            myconstants.method_config.get("compound_options", [])
+        ):
+            cmp_name = f"pattern_compound_{i}"
+            self.meta_creator(cmp_name)
+            tokens = [{"LOWER": word} for word in compound.split()]
+            # Register two patterns: with and without "to" prefix
+            pattern_bare = tokens[:]
+            pattern_with_to = [{"LOWER": "to"}] + tokens
+            self.matcher.add(
+                f"{self.element_key}_{cmp_name}", [pattern_bare, pattern_with_to]
+            )
+            self.metadata[f"{self.element_key}_{cmp_name}"] = {
+                "verb": [0, None],  # entire span is the verb phrase
+            }
+
     def phrase_parts(self, span, found_dict, token_dict):
-        found_dict["verb"].append(token_dict["verb"])
-        formatted_phrase = f"{found_dict['verb'][-1]}"
+        verb = token_dict["verb"]
+        # Strip leading "to " from compound matches (e.g. "to apply sparingly" → "apply sparingly")
+        if isinstance(verb, str) and verb.lower().startswith("to "):
+            verb = verb[3:]
+        found_dict["verb"].append(verb)
+        formatted_phrase = f"{verb}"
         return formatted_phrase, found_dict
 
 
 class MethodPassiveElement(BaseElement):
     """
-    Please see the base class for explanations of the steps and contents of the classes. The layout, functions and
-    attributes are similar across all child classes.
+    Matches passive method phrases ("to be taken", "applied", "given" etc.)
+    and outputs the lemmatised verb form (e.g. "take", "apply", "give").
+
+    Note: spaCy lemmatises "instilled" → "instill" (American/SNOMED spelling),
+    not "instil" (British). The _clean output uses spaCy's lemma directly,
+    so the output will be "instill" — this matches SNOMED terminology.
     """
 
     element_key = "methodPassive"
@@ -233,10 +277,7 @@ class MethodPassiveElement(BaseElement):
                 {"LOWER": {"IN": myconstants.method_config["past_participles"]}},
             ]
         )
-        """
-        Captures:
-            to be taken. extracts "take"
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "verb": -1,
@@ -249,10 +290,7 @@ class MethodPassiveElement(BaseElement):
                 {"LOWER": {"IN": myconstants.method_config["past_participles"]}},
             ]
         )
-        """
-        Captures:
-            taken. extracts "take"
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "verb": -1,
@@ -295,28 +333,16 @@ class DoseQuantityElement(BaseElement):
             {"LOWER": {"REGEX": r"^(5|2\.5)$"}},
             {"IS_SPACE": True, "OP": "?"},
             {"LOWER": {"REGEX": r"mls?"}},
-            {"LEMMA": {"IN": ["spoon", "spoonful"]}},
+            {"NORM": {"IN": ["spoon", "spoonful"]}},
         ]
-        """
-        Captures:
-            4 x 5 ml spoonful
-            4 5 ml spoonful  # should this be captured?
-            4 x 5 ml spoon
-            4 x 5 mls spoonful
-            4 x 5ml spoonful
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", [self.pattern])
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "quantity": 0,
             "units": -1,
             "spoonsize": -3,
         }
-        """
-        Captures:
-            4 tablets
-            2 chewable tablets
-            1 capsule
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.register_patterns_with_multiword(
             "pattern2",
             base_tokens=[{"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}}],
@@ -326,13 +352,15 @@ class DoseQuantityElement(BaseElement):
 
     def phrase_parts(self, span, found_dict, token_dict):
         pattern_name = token_dict["pattern_name"]
-        found_dict["quantity"].append(token_dict["quantity"])
-        found_dict["units"].append(token_dict["units"])
+        qty = token_dict["quantity"]
+        units = _resolve_parenthetical_s(token_dict["units"], qty)
+        found_dict["quantity"].append(qty)
+        found_dict["units"].append(units)
         found_dict["spoonsize"].append(token_dict["spoonsize"])
         if pattern_name == "pattern1":
-            formatted_phrase = f"{found_dict['quantity'][-1]} x {found_dict['spoonsize'][-1]}ml spoonfuls"
+            formatted_phrase = f"{qty} x {found_dict['spoonsize'][-1]}ml spoonfuls"
         elif pattern_name.startswith("pattern2"):
-            formatted_phrase = f"{found_dict['quantity'][-1]} {found_dict['units'][-1]}"
+            formatted_phrase = f"{qty} {units}"
         else:
             raise AssertionError(
                 f"pattern_name: {pattern_name} is not accounted for in this section"
@@ -373,14 +401,7 @@ class DoseQuantityValueOnlyElement(BaseElement):
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 0,
         }
-        """
-        Captures:
-            1
-            3.25
-            0.5
-            not 5.6
-            not 120
-        """
+        # See to_test.py element_specific for capture/ignore examples
 
     def phrase_parts(self, span, found_dict, token_dict):
         found_dict["value"].append(token_dict["value"])
@@ -421,29 +442,7 @@ class DoseXMilliValueOnlyElement(BaseElement):
                 {"LOWER": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            120 x 42ml
-            120 x 42 ml
-            120 x 42 mls
-            120 x 42mls
-            12 42mls
-            120 x42ml
-            120x 42 ml
-            120x42 ml
-            120x42ml
-            1 x 42ml
-            3.25 x 42ml
-            0.5 x 42ml
-            4 x 42.6ml  # Qcall should we limit to only .25 .5?
-            5.7 x 4.3ml
-            5 x 4 millilitre
-            5 x 4 millilitres
-            5 x 4 milligram  # Qcall should we allow mgs?
-            5 x 4 milligrams
-            5 x 4 mg
-            5 x 4 mgs
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 0,
@@ -490,17 +489,7 @@ class DoseQuantityValueAndMaxOnlyElement(BaseElement):
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
             ]
         )
-        """
-        Captures:
-            120 - 122 (with help from nlp.Defaults.infixes)
-            1-2
-            1 -2 (with help from replace: weird_terms)
-            1- 2
-            3.25 to 4
-            0.5 or 1
-            not 5.6 - 5.7
-            not 4 then 5
-        """
+        # See to_test.py element_specific for capture/ignore examples
 
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
@@ -542,14 +531,9 @@ class DoseRangeElement(BaseElement):
             {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
             {"LOWER": {"IN": ["to", "or", "-"]}},
             {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-            {"LEMMA": {"IN": self.options}},
+            {"NORM": {"IN": self.options}},
         ]
-        """
-        Captures:
-            120 - 122 drops
-            1-2 tables
-            1 -2 sprays
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", [self.pattern])
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "low": 0,
@@ -562,13 +546,9 @@ class DoseRangeElement(BaseElement):
             {"LOWER": "up"},
             {"LOWER": "to"},
             {"TEXT": {"REGEX": "^[0-9]$"}},
-            {"LEMMA": {"IN": self.options}},
+            {"NORM": {"IN": self.options}},
         ]
-        """
-        Captures:
-            up to 5 tablets
-            up to 1 spray
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", [self.pattern])
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "high": 2,
@@ -585,16 +565,9 @@ class DoseRangeElement(BaseElement):
             {"LOWER": {"REGEX": r"^(5|2\.5)$"}},
             {"IS_SPACE": True, "OP": "?"},
             {"LOWER": {"REGEX": r"mls?"}},
-            {"LEMMA": {"IN": ["spoon", "spoonful"]}},
+            {"NORM": {"IN": ["spoon", "spoonful"]}},
         ]
-        """
-        Captures:
-            1-4 x 5 ml spoonful
-            1-4 5 ml spoonful  # should this be captured?
-            1-4 x 5 ml spoon
-            1-4 x 5 mls spoonful
-            1-4 x 5ml spoonful
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", [self.pattern])
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "low": 0,
@@ -605,18 +578,19 @@ class DoseRangeElement(BaseElement):
 
     def phrase_parts(self, span, found_dict, token_dict):
         pattern_name = token_dict["pattern_name"]
-        found_dict["units"].append(token_dict["units"])
+        # For doseRange, resolve (s) using the high value (e.g. "1 to 2 tablet(s)" → "tablets")
+        high = token_dict["high"]
+        units = _resolve_parenthetical_s(token_dict["units"], high)
+        found_dict["units"].append(units)
         found_dict["low"].append(token_dict["low"])
-        found_dict["high"].append(token_dict["high"])
+        found_dict["high"].append(high)
         found_dict["spoonsize"].append(token_dict["spoonsize"])
         if pattern_name == "pattern1":
-            formatted_phrase = f"{found_dict['low'][-1]} to {found_dict['high'][-1]} {found_dict['units'][-1]}"
+            formatted_phrase = f"{found_dict['low'][-1]} to {high} {units}"
         elif pattern_name == "pattern2":
-            formatted_phrase = (
-                f"up to {found_dict['high'][-1]} {found_dict['units'][-1]}"
-            )
+            formatted_phrase = f"up to {high} {units}"
         elif pattern_name == "pattern3":
-            formatted_phrase = f"{found_dict['low'][-1]} to {found_dict['high'][-1]} x {found_dict['spoonsize'][-1]}ml spoonfuls"
+            formatted_phrase = f"{found_dict['low'][-1]} to {high} x {found_dict['spoonsize'][-1]}ml spoonfuls"
         else:
             raise AssertionError(
                 f"pattern_name: {pattern_name} is not accounted for in this section"
@@ -654,12 +628,9 @@ class RateRatioElement(BaseElement):
             {"LOWER": "of"},
             {"LIKE_NUM": True},
             {"LOWER": "per"},
-            {"LEMMA": {"IN": self.options}},
+            {"NORM": {"IN": self.options}},
         ]
-        """
-        Captures:
-            at a rate of 4 per day
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", [self.pattern])
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "numerator": 4,
@@ -677,13 +648,10 @@ class RateRatioElement(BaseElement):
                 {"LIKE_NUM": True},
                 {"LOWER": "every"},
                 {"LIKE_NUM": True},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            at a rate of 3 every 2 weeks
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "numerator": 4,
@@ -732,11 +700,7 @@ class RateRangeElement(BaseElement):
     def define_pattern(self):
         self.metadata = {}
 
-        """
-        Captures:
-            at a rate of 1 to 4 litres per minute
-            at a rate of 2 to 5 microgram per kilogram per hour
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.register_patterns_with_multiword(
             "pattern1",
             base_tokens=[
@@ -758,10 +722,7 @@ class RateRangeElement(BaseElement):
         found_dict["high"].append(token_dict["high"])
         found_dict["special_unit"].append(token_dict["special_unit"])
         if pattern_name.startswith("pattern1"):
-            formatted_phrase = (
-                f"at a rate of {found_dict['low'][-1]} to "
-                f"{found_dict['high'][-1]} {found_dict['special_unit'][-1]}"
-            )
+            formatted_phrase = f"at a rate of {found_dict['low'][-1]} to {found_dict['high'][-1]} {found_dict['special_unit'][-1]}"
         else:
             raise AssertionError(
                 f"pattern_name: {pattern_name} is not accounted for in this section"
@@ -791,11 +752,7 @@ class RateQuantityElement(BaseElement):
     def define_pattern(self):
         self.metadata = {}
 
-        """
-        Captures:
-            at a rate of 5 litres per minute
-            at a rate of 2 microgram per kilogram per hour
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.register_patterns_with_multiword(
             "pattern1",
             base_tokens=[
@@ -837,7 +794,11 @@ class DurationElement(BaseElement):
         self.define_pattern()
 
     def define_options(self):
-        self.options = myconstants.period_unit_config["options"]
+        self.options = [
+            u
+            for u in myconstants.period_unit_config["options"]
+            if u not in ("week", "fortnight", "month", "year", "annual")
+        ]
         self.prefixes = myconstants.period_unit_config["prefixes"]
         self.suffixes = myconstants.period_unit_config["suffixes"]
 
@@ -850,13 +811,10 @@ class DurationElement(BaseElement):
             [
                 {"LOWER": "over"},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            over 5 days
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 1,
@@ -901,14 +859,10 @@ class DurationMaxElement(BaseElement):
             [
                 {"LOWER": {"IN": ["maximum", "max"]}},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            max 5 weeks
-            maximum 3 days
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 1,
@@ -954,18 +908,11 @@ class FrequencyBareElement(BaseElement):
             [
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
                 {"TEXT": "times"},
-                {"LEMMA": {"IN": myconstants.period_unit_config["prefixes"]}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["prefixes"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["options"]}},
             ]
         )
-        """
-        Captures:
-            4 times per day
-            2 times each week
-            three times/day
-            1 time a month
-            twice every year
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "frequency": 0,
@@ -979,15 +926,11 @@ class FrequencyBareElement(BaseElement):
         self.pattern.append(
             [
                 {"LOWER": "once"},
-                {"LEMMA": {"IN": myconstants.period_unit_config["prefixes"]}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["prefixes"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["options"]}},
             ]
         )
-        """
-        Captures:
-            once a day
-            once every fortnight
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "frequency": 0,
@@ -1001,17 +944,12 @@ class FrequencyBareElement(BaseElement):
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
                 {"ORTH": {"IN": ["to", "or", "-"]}},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": "time"},
-                {"LEMMA": {"IN": myconstants.period_unit_config["prefixes"]}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": "time"},
+                {"NORM": {"IN": myconstants.period_unit_config["prefixes"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["options"]}},
             ]
         )
-        """
-        Captures:
-            1 to 3 times per week
-            1-2 times a day
-            4 or 5 times a year
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "frequency": 0,
@@ -1026,16 +964,12 @@ class FrequencyBareElement(BaseElement):
                 {"LOWER": "up"},
                 {"LOWER": "to"},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": "time"},
-                {"LEMMA": {"IN": myconstants.period_unit_config["prefixes"]}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": "time"},
+                {"NORM": {"IN": myconstants.period_unit_config["prefixes"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["options"]}},
             ]
         )
-        """
-        Captures:
-            up to 6 times per week
-            up to 1 time a day
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "frequencyMax": 2,
@@ -1049,16 +983,12 @@ class FrequencyBareElement(BaseElement):
             [
                 {"LOWER": "up"},
                 {"LOWER": "to"},
-                {"LEMMA": "once"},
-                {"LEMMA": {"IN": myconstants.period_unit_config["prefixes"]}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": "once"},
+                {"NORM": {"IN": myconstants.period_unit_config["prefixes"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["options"]}},
             ]
         )
-        """
-        Captures:
-            up to once per week
-            up to once a day
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "period_unit": 4,
@@ -1071,22 +1001,24 @@ class FrequencyBareElement(BaseElement):
         found_dict["period_unit"].append(token_dict["period_unit"])
         if pattern_name in ["pattern1"]:
             if found_dict["frequency"][-1] == 1:
-                formatted_phrase = f"once per {found_dict['period_unit'][-1]}"
+                formatted_phrase = f"once every {found_dict['period_unit'][-1]}"
             elif found_dict["frequency"][-1] == 2:
-                formatted_phrase = f"twice per {found_dict['period_unit'][-1]}"
+                formatted_phrase = f"twice every {found_dict['period_unit'][-1]}"
             else:
-                formatted_phrase = f"{found_dict['frequency'][-1]} times per {found_dict['period_unit'][-1]}"
+                formatted_phrase = f"{found_dict['frequency'][-1]} times every {found_dict['period_unit'][-1]}"
         elif pattern_name in ["pattern1once"]:
-            formatted_phrase = f"once per {found_dict['period_unit'][-1]}"
+            found_dict["frequency"][-1] = "1"
+            formatted_phrase = f"once every {found_dict['period_unit'][-1]}"
         elif pattern_name in ["pattern2"]:
             formatted_phrase = (
                 f"{found_dict['frequency'][-1]} to {found_dict['frequencyMax'][-1]} "
-                f"times per {found_dict['period_unit'][-1]}"
+                f"times every {found_dict['period_unit'][-1]}"
             )
         elif pattern_name in ["pattern3"]:
-            formatted_phrase = f"up to {found_dict['frequencyMax'][-1]} times per {found_dict['period_unit'][-1]}"
+            formatted_phrase = f"up to {found_dict['frequencyMax'][-1]} times every {found_dict['period_unit'][-1]}"
         elif pattern_name in ["pattern3.once"]:
-            formatted_phrase = f"up to once per {found_dict['period_unit'][-1]}"
+            found_dict["frequencyMax"][-1] = "1"
+            formatted_phrase = f"up to once every {found_dict['period_unit'][-1]}"
         else:
             raise AssertionError(
                 f"pattern_name: {pattern_name} is not accounted for in this section"
@@ -1131,18 +1063,11 @@ class FrequencyWithMethodElement(BaseElement):
                 {"TEXT": {"IN": myconstants.method_config["past_participles"]}},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
                 {"TEXT": "times"},
-                {"LEMMA": {"IN": myconstants.period_unit_config["prefixes"]}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["prefixes"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["options"]}},
             ]
         )
-        """
-        Captures:
-            to be taken 4 times per day
-            to be taken 2 times each week
-            to be taken three times/day
-            to be taken 1 time a month
-            to be taken twice every year
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "frequency": 3,
@@ -1157,15 +1082,11 @@ class FrequencyWithMethodElement(BaseElement):
                 {"LOWER": "be"},
                 {"TEXT": {"IN": myconstants.method_config["past_participles"]}},
                 {"LOWER": "once"},
-                {"LEMMA": {"IN": myconstants.period_unit_config["prefixes"]}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["prefixes"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["options"]}},
             ]
         )
-        """
-        Captures:
-            to be taken once a day
-            to be taken once every fortnight
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "frequency": 3,
@@ -1182,17 +1103,12 @@ class FrequencyWithMethodElement(BaseElement):
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
                 {"ORTH": {"IN": ["to", "or", "-"]}},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": "time"},
-                {"LEMMA": {"IN": myconstants.period_unit_config["prefixes"]}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": "time"},
+                {"NORM": {"IN": myconstants.period_unit_config["prefixes"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["options"]}},
             ]
         )
-        """
-        Captures:
-            to be taken 1 to 3 times per week
-            to be taken 1-2 times a day
-            to be taken 4 or 5 times a year
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "frequency": 3,
@@ -1210,16 +1126,12 @@ class FrequencyWithMethodElement(BaseElement):
                 {"LOWER": "up"},
                 {"LOWER": "to"},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": "time"},
-                {"LEMMA": {"IN": myconstants.period_unit_config["prefixes"]}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": "time"},
+                {"NORM": {"IN": myconstants.period_unit_config["prefixes"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["options"]}},
             ]
         )
-        """
-        Captures:
-            to be taken up to 6 times per week
-            to be taken up to 1 time a day
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "frequencyMax": 5,
@@ -1235,16 +1147,12 @@ class FrequencyWithMethodElement(BaseElement):
                 {"LOWER": {"IN": myconstants.method_config["past_participles"]}},
                 {"LOWER": "up"},
                 {"LOWER": "to"},
-                {"LEMMA": "once"},
-                {"LEMMA": {"IN": myconstants.period_unit_config["prefixes"]}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": "once"},
+                {"NORM": {"IN": myconstants.period_unit_config["prefixes"]}},
+                {"NORM": {"IN": myconstants.period_unit_config["options"]}},
             ]
         )
-        """
-        Captures:
-            to be taken up to 6 times per week
-            to be taken up to 1 time a day
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "period_unit": 7,
@@ -1257,24 +1165,26 @@ class FrequencyWithMethodElement(BaseElement):
         found_dict["period_unit"].append(token_dict["period_unit"])
         if pattern_name in ["pattern1.tobetaken"]:
             if found_dict["frequency"][-1] == 1:
-                formatted_phrase = f"once per {found_dict['period_unit'][-1]}"
+                formatted_phrase = f"once every {found_dict['period_unit'][-1]}"
             elif found_dict["frequency"][-1] == 2:
-                formatted_phrase = f"twice per {found_dict['period_unit'][-1]}"
+                formatted_phrase = f"twice every {found_dict['period_unit'][-1]}"
             else:
-                formatted_phrase = f"{found_dict['frequency'][-1]} times per {found_dict['period_unit'][-1]}"
+                formatted_phrase = f"{found_dict['frequency'][-1]} times every {found_dict['period_unit'][-1]}"
         elif pattern_name in ["pattern1.once.tobetaken"]:
-            formatted_phrase = f"once per {found_dict['period_unit'][-1]}"
+            found_dict["frequency"][-1] = "1"
+            formatted_phrase = f"once every {found_dict['period_unit'][-1]}"
         elif pattern_name in ["pattern2.tobetaken"]:
             formatted_phrase = (
                 f"{found_dict['frequency'][-1]} to {found_dict['frequencyMax'][-1]} "
-                f"times per {found_dict['period_unit'][-1]}"
+                f"times every {found_dict['period_unit'][-1]}"
             )
         elif pattern_name in [
             "pattern3.tobetaken",
         ]:
-            formatted_phrase = f"up to {found_dict['frequencyMax'][-1]} times per {found_dict['period_unit'][-1]}"
+            formatted_phrase = f"up to {found_dict['frequencyMax'][-1]} times every {found_dict['period_unit'][-1]}"
         elif pattern_name in ["pattern3.once.tobetaken"]:
-            formatted_phrase = f"up to once per {found_dict['period_unit'][-1]}"
+            found_dict["frequencyMax"][-1] = "1"
+            formatted_phrase = f"up to once every {found_dict['period_unit'][-1]}"
         else:
             raise AssertionError(
                 f"pattern_name: {pattern_name} is not accounted for in this section"
@@ -1309,15 +1219,10 @@ class CountElement(BaseElement):
         self.pattern.append(
             [
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": "time"},
+                {"NORM": "time"},
             ]
         )
-        """
-        Captures:
-            2 times
-            5 times
-            1 time
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "count": 0,
@@ -1327,13 +1232,10 @@ class CountElement(BaseElement):
         self.pattern = []
         self.pattern.append(
             [
-                {"LEMMA": "once"},
+                {"NORM": "once"},
             ]
         )
-        """
-        Captures:
-            once
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "count": 0,
@@ -1347,16 +1249,10 @@ class CountElement(BaseElement):
                 {"ORTH": {"IN": ["to", "or"]}},
                 # Note: removed "-" as an option because three - four times could mean 3 to 4 times or take 3, 4 times.
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": "time"},
+                {"NORM": "time"},
             ]
         )
-        """
-        Captures:
-            1 to 2 times
-            2 or 3 times
-            not three - four times
-            not 1 - 2 times
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "count": 0,
@@ -1370,13 +1266,10 @@ class CountElement(BaseElement):
                 {"LOWER": "up"},
                 {"LOWER": "to"},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": "time"},
+                {"NORM": "time"},
             ]
         )
-        """
-        Captures:
-            up to 4 times
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "countMax": 2,
@@ -1394,10 +1287,11 @@ class CountElement(BaseElement):
             else:
                 formatted_phrase = f"{found_dict['count'][-1]} times"
         elif pattern_name == "pattern1once":
+            found_dict["count"][-1] = "1"
             formatted_phrase = "once"
         elif pattern_name == "pattern2":
             formatted_phrase = (
-                f"{found_dict['count'][-1]} to {found_dict['countMax'][-1]} " f"times"
+                f"{found_dict['count'][-1]} to {found_dict['countMax'][-1]} times"
             )
         elif pattern_name == "pattern3":
             formatted_phrase = f"up to {found_dict['countMax'][-1]} times"
@@ -1415,7 +1309,7 @@ class PeriodElement(BaseElement):
     """
 
     element_key = "periodElement"
-    element_split = ["period", "periodMax", "period_units"]
+    element_split = ["period", "periodMax", "period_units", "frequency"]
 
     def __init__(self, nlp, matcher):
         super().__init__(nlp, matcher)
@@ -1423,7 +1317,11 @@ class PeriodElement(BaseElement):
         self.define_pattern()
 
     def define_options(self):
-        self.options = myconstants.period_unit_config["options"]
+        self.options = [
+            u
+            for u in myconstants.period_unit_config["options"]
+            if u not in ("year", "annual")
+        ]
         self.prefixes = myconstants.period_unit_config["prefixes"]
         self.suffixes = myconstants.period_unit_config["suffixes"]
 
@@ -1434,20 +1332,11 @@ class PeriodElement(BaseElement):
         self.pattern = []
         self.pattern.append(
             [
-                {"LEMMA": {"IN": self.prefixes}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.prefixes}},
+                {"NORM": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            per day
-            each week
-            every month
-            /day
-            monthly
-            hourly
-            a minute
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "period_units": 1,
@@ -1457,16 +1346,12 @@ class PeriodElement(BaseElement):
         self.pattern = []
         self.pattern.append(
             [
-                {"LEMMA": {"IN": self.prefixes}},
+                {"NORM": {"IN": self.prefixes}},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            per 4 days
-            every 5 weeks
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "period": 1,
@@ -1477,18 +1362,14 @@ class PeriodElement(BaseElement):
         self.pattern = []
         self.pattern.append(
             [
-                {"LEMMA": {"IN": self.prefixes}},
+                {"NORM": {"IN": self.prefixes}},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
                 {"TEXT": {"IN": ["to", "-", "or"]}},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            every 1-2 days
-            per 4 to 5 weeks
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "period": 1,
@@ -1502,14 +1383,10 @@ class PeriodElement(BaseElement):
             [
                 {"ORTH": {"IN": self.prefixes}},
                 {"TEXT": "other"},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            every other day
-            each other week
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "period_units": -1,
@@ -1521,13 +1398,10 @@ class PeriodElement(BaseElement):
             [
                 {"TEXT": "on", "OP": "?"},
                 {"TEXT": "alternate"},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            on alternate days
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "period_units": -1,
@@ -1536,25 +1410,25 @@ class PeriodElement(BaseElement):
     def phrase_parts(self, span, found_dict, token_dict):
         pattern_name = token_dict["pattern_name"]
         found_dict["period"].append(token_dict["period"])
+        found_dict["period"][-1] = found_dict["period"][-1] or "1"
         found_dict["periodMax"].append(token_dict["periodMax"])
         found_dict["period_units"].append(token_dict["period_units"])
+        found_dict["frequency"].append(myconstants.IMPLIED_FREQUENCY)
         if pattern_name == "pattern1":
-            formatted_phrase = f"every {found_dict['period_units'][-1]}"
+            formatted_phrase = f"once every {found_dict['period_units'][-1]}"
         elif pattern_name == "pattern2":
-            formatted_phrase = (
-                f"every {found_dict['period'][-1]} {found_dict['period_units'][-1]}"
-            )
+            if found_dict["period"][-1] == "1":
+                formatted_phrase = f"once every {found_dict['period_units'][-1]}"
+            else:
+                formatted_phrase = f"once every {found_dict['period'][-1]} {found_dict['period_units'][-1]}"
         elif pattern_name == "pattern3":
-            formatted_phrase = (
-                f"every {found_dict['period'][-1]} to {found_dict['periodMax'][-1]} "
-                f"{found_dict['period_units'][-1]}"
-            )
+            formatted_phrase = f"once every {found_dict['period'][-1]} to {found_dict['periodMax'][-1]} {found_dict['period_units'][-1]}"
         elif pattern_name == "pattern4":
             found_dict["period"][-1] = "2"
-            formatted_phrase = f"every 2 {found_dict['period_units'][-1]}s"
+            formatted_phrase = f"once every 2 {found_dict['period_units'][-1]}s"
         elif pattern_name == "pattern5":
             found_dict["period"][-1] = "2"
-            formatted_phrase = f"every 2 {found_dict['period_units'][-1]}"
+            formatted_phrase = f"once every 2 {found_dict['period_units'][-1]}"
         else:
             raise AssertionError(
                 f"pattern_name: {pattern_name} is not accounted for in this section"
@@ -1583,60 +1457,44 @@ class WhenBareElement(BaseElement):
     def define_pattern(self):
         self.metadata = {}
 
-        """
-        Captures:
-            4 to 5 days before evening meal
-            30-60 minutes after breakfast
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.register_patterns_with_multiword(
             "pattern1",
             base_tokens=[
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
                 {"LOWER": {"IN": ["to", "or", "-"]}},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.period_unit_options}},
+                {"NORM": {"IN": self.period_unit_options}},
             ],
             options=self.options,
             metadata={"when": [0, None], "offset": 0, "offsetMax": 2, "period_unit": 3},
         )
 
-        """
-        Captures:
-            at least 12 minutes after waking
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.register_patterns_with_multiword(
             "pattern2a",
             base_tokens=[
                 {"LOWER": "at"},
                 {"LOWER": "least"},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.period_unit_options}},
+                {"NORM": {"IN": self.period_unit_options}},
             ],
             options=self.options,
             metadata={"when": [0, None], "offset": 2, "period_unit": 3},
         )
 
-        """
-        Captures:
-            1 hour after bedtime
-            2 hours before food
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.register_patterns_with_multiword(
             "pattern2b",
             base_tokens=[
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.period_unit_options}},
+                {"NORM": {"IN": self.period_unit_options}},
             ],
             options=self.options,
             metadata={"when": [0, None], "offset": 0, "period_unit": 1},
         )
 
-        """
-        Captures:
-            after a meal
-            with evening meal
-            at noon
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.register_patterns_with_multiword(
             "pattern4",
             base_tokens=[],
@@ -1669,17 +1527,13 @@ class WhenWithMethodElement(BaseElement):
         self.define_pattern()
 
     def define_options(self):
-        self.options = myconstants.when_config
+        self.options = myconstants.when_config["options"]
         self.period_unit_options = myconstants.period_unit_config["options"]
 
     def define_pattern(self):
         self.metadata = {}
 
-        """
-        Captures:
-            to be taken 4 to 5 days before evening meal
-            to be taken 30-60 minutes after breakfast
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.register_patterns_with_multiword(
             "pattern1",
             base_tokens=[
@@ -1689,16 +1543,13 @@ class WhenWithMethodElement(BaseElement):
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
                 {"LOWER": {"IN": ["to", "or", "-"]}},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.period_unit_options}},
+                {"NORM": {"IN": self.period_unit_options}},
             ],
             options=self.options,
             metadata={"when": [0, None], "offset": 3, "offsetMax": 5, "period_unit": 6},
         )
 
-        """
-        Captures:
-            to be taken at least 12 minutes after waking
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.register_patterns_with_multiword(
             "pattern2a",
             base_tokens=[
@@ -1708,17 +1559,13 @@ class WhenWithMethodElement(BaseElement):
                 {"LOWER": "at"},
                 {"LOWER": "least"},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.period_unit_options}},
+                {"NORM": {"IN": self.period_unit_options}},
             ],
             options=self.options,
             metadata={"when": [0, None], "offset": 5, "period_unit": 6},
         )
 
-        """
-        Captures:
-            to be taken 1 hour after bedtime
-            to be taken 2 hours before food
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.register_patterns_with_multiword(
             "pattern2b",
             base_tokens=[
@@ -1726,17 +1573,13 @@ class WhenWithMethodElement(BaseElement):
                 {"LOWER": "be"},
                 {"LOWER": {"IN": myconstants.method_config["past_participles"]}},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.period_unit_options}},
+                {"NORM": {"IN": self.period_unit_options}},
             ],
             options=self.options,
             metadata={"when": [0, None], "offset": 3, "period_unit": 4},
         )
 
-        """
-        Captures:
-            to be taken with food
-            to be applied after main meal
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.register_patterns_with_multiword(
             "pattern4",
             base_tokens=[
@@ -1764,7 +1607,7 @@ class MilligramMaxElement(BaseElement):
     """
 
     element_key = "milligramMax"
-    element_split = ["value", "valueMax", "milligram_units"]
+    element_split = ["value", "valueMax", "milligram_units", "low_unit"]
 
     def __init__(self, nlp, matcher):
         super().__init__(nlp, matcher)
@@ -1785,18 +1628,14 @@ class MilligramMaxElement(BaseElement):
         self.pattern.append(
             [
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-                {"LOWER": {"IN": ["or", "to", "-"]}},
+                {
+                    "LOWER": {"IN": ["or", "to"]}
+                },  # Excluded "-" because 1- 60mg could be ambiguous
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
                 {"LOWER": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            4.5 or 5ml
-            4 to 5 mls
-            4 - 5 ml
-            1 to 2 milligrams
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 0,
@@ -1815,16 +1654,11 @@ class MilligramMaxElement(BaseElement):
                 {"LOWER": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            4.5ml or 5ml
-            4ml to 5 mls
-            4mls - 5 ml
-            0.5 - 1 millilitre
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 0,
+            "low_unit": 1,
             "valueMax": 3,
             "milligram_units": 4,
         }
@@ -1833,6 +1667,7 @@ class MilligramMaxElement(BaseElement):
         found_dict["value"].append(token_dict["value"])
         found_dict["valueMax"].append(token_dict["valueMax"])
         found_dict["milligram_units"].append(token_dict["milligram_units"])
+        found_dict["low_unit"].append(token_dict["low_unit"])
         formatted_phrase = f"{found_dict['value'][-1]} to {found_dict['valueMax'][-1]} {found_dict['milligram_units'][-1]}"
         return formatted_phrase, found_dict
 
@@ -1867,14 +1702,7 @@ class MilligramValueElement(BaseElement):
                 {"LOWER": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            4.5ml
-            5.25mg
-            3 mls
-            2 milligrams
-            1millilitre
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 0,
@@ -1917,17 +1745,12 @@ class DayOfWeekElement(BaseElement):
         self.pattern.append(
             [
                 {"LOWER": "on"},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
                 # {"TEXT": {"IN": [",", "and"]}, "OP": "*"},  # Removed due to rule 7
-                # {"LEMMA": {"IN": self.options}, "OP": "*"},  # Removed due to rule 7
+                # {"NORM": {"IN": self.options}, "OP": "*"},  # Removed due to rule 7
             ]
         )
-        """
-        Captures:
-            on Monday
-            on tue
-
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {"value": 0}
 
@@ -1968,35 +1791,26 @@ class TimeOfDayElement(BaseElement):
                 {"IS_SPACE": True, "OP": "?"},
                 {"TEXT": {"REGEX": "^(am|pm|noon)$"}},
                 # {"TEXT": {"IN": [",", "and"]}, "OP": "*"},  # Removed due to rule 7
-                # {"LEMMA": {"REGEX": "^([0-9]|10|11|12)(am|pm|noon)$"}, "OP": "*"},  # Removed due to rule 7
+                # {"NORM": {"REGEX": "^([0-9]|10|11|12)(am|pm|noon)$"}, "OP": "*"},  # Removed due to rule 7
             ]
         )
-        """
-        Captures:
-            at 5pm
-            at 1am
-            at 12 noon
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.pattern.append(
             [
                 {"LOWER": "at"},
-                {"LEMMA": {"REGEX": "^(0?[0-9]|1[0-9]|2[0-4]):(00|15|30|45)$"}},
+                {"NORM": {"REGEX": "^(0[1-9]|1[0-9]|2[0-4]):(00|15|30|45)$"}},
                 # {"TEXT": {"IN": [",", "and"]}, "OP": "*"},
                 # {
-                #     "LEMMA": {"REGEX": "^(0?[0-9]|1[0-9]|2[0-4]):(00|15|30|45)$"},
+                #     "NORM": {"REGEX": "^(0?[0-9]|1[0-9]|2[0-4]):(00|15|30|45)$"},
                 #     "OP": "*",
                 # }, # Removed due to rule 7
             ]
         )
-        """
-        Captures:
-            at 1:45
-            at 03:30
-            at 15:30
-            not at 3:00, 3:15 and 3:30
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
-        self.metadata[f"{self.element_key}_{pattern_name}"] = {"value": 0}
+        self.metadata[f"{self.element_key}_{pattern_name}"] = {
+            "value": 0
+        }  # not used as span is taken in phrase parts
 
     def phrase_parts(self, span, found_dict, token_dict):
         found_dict["value"].append(span.text)
@@ -2022,6 +1836,12 @@ class MaxDosePerPeriodElement(BaseElement):
         self.options = myconstants.unit_config["options"]
         self.prefixes = myconstants.unit_config["prefixes"]
         self.suffixes = myconstants.unit_config["suffixes"]
+        # Denominator period restricted to week or shorter (no fortnight/month/year)
+        self.denom_options = [
+            u
+            for u in myconstants.period_unit_config["options"]
+            if u not in ("fortnight", "month", "year", "annual")
+        ]
 
     def define_pattern(self):
         # Qcall2: can we add "maximum 8 tablets in 24 hours"
@@ -2039,18 +1859,13 @@ class MaxDosePerPeriodElement(BaseElement):
                 {"LOWER": {"IN": ["max", "maximum"]}},
                 {"LOWER": "of", "OP": "?"},
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
                 {"LOWER": "in"},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": {"IN": self.denom_options}},
             ]
         )
-        """
-        Captures:
-            up to a maximum of 3 tablets in 4 days
-            maximum of 3 tablets in 4 weeks
-            up to a max of 3 tablets in 4 years
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "num_value": -5,
@@ -2069,18 +1884,13 @@ class MaxDosePerPeriodElement(BaseElement):
                 {"LOWER": {"IN": ["max", "maximum"]}},
                 {"LOWER": "of", "OP": "?"},
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
                 {"LOWER": "in"},
                 {"LOWER": "a"},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": {"IN": self.denom_options}},
             ]
         )
-        """
-        Captures:
-            up to a maximum of 3 tablets in a day
-            maximum of 3 tablets in a week
-            up to a max 3 tablets in a year
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "num_value": -5,
@@ -2099,17 +1909,12 @@ class MaxDosePerPeriodElement(BaseElement):
                 {"LOWER": {"IN": ["max", "maximum"]}},
                 {"LOWER": "of", "OP": "?"},
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-                {"LEMMA": {"IN": self.options}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["prefixes"]}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": {"IN": self.options}},
+                {"NORM": {"IN": myconstants.period_unit_config["prefixes"]}},
+                {"NORM": {"IN": self.denom_options}},
             ]
         )
-        """
-        Captures:
-            up to a maximum of 3 tablets every day
-            maximum of 3 tablets each week
-            up to a max of 3 tablets per year
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "num_value": -4,
@@ -2125,17 +1930,13 @@ class MaxDosePerPeriodElement(BaseElement):
                 {"LOWER": "more"},
                 {"LOWER": "than"},
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
                 {"LOWER": "in"},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": {"IN": self.denom_options}},
             ]
         )
-        """
-        Captures:
-            no more than 3 tablets in 4 days
-            not more than 3 tablets in 4 weeks
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "num_value": -5,
@@ -2152,17 +1953,13 @@ class MaxDosePerPeriodElement(BaseElement):
                 {"LOWER": "more"},
                 {"LOWER": "than"},
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
                 {"LOWER": "in"},
                 {"LOWER": "a"},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": {"IN": self.denom_options}},
             ]
         )
-        """
-        Captures:
-            no more than 3 tablets in a day
-            not more than 3 tablets in a week
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "num_value": -5,
@@ -2178,16 +1975,12 @@ class MaxDosePerPeriodElement(BaseElement):
                 {"LOWER": "more"},
                 {"LOWER": "than"},
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-                {"LEMMA": {"IN": self.options}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["prefixes"]}},
-                {"LEMMA": {"IN": myconstants.period_unit_config["options"]}},
+                {"NORM": {"IN": self.options}},
+                {"NORM": {"IN": myconstants.period_unit_config["prefixes"]}},
+                {"NORM": {"IN": self.denom_options}},
             ]
         )
-        """
-        Captures:
-            no more than 3 tablets every day
-            not more than 3 tablets each week
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "num_value": -4,
@@ -2197,8 +1990,10 @@ class MaxDosePerPeriodElement(BaseElement):
 
     def phrase_parts(self, span, found_dict, token_dict):
         pattern_name = token_dict["pattern_name"]
-        found_dict["num_value"].append(token_dict["num_value"])
-        found_dict["num_unit"].append(token_dict["num_unit"])
+        num_value = token_dict["num_value"]
+        num_unit = _resolve_parenthetical_s(token_dict["num_unit"], num_value)
+        found_dict["num_value"].append(num_value)
+        found_dict["num_unit"].append(num_unit)
         found_dict["denom_value"].append(token_dict["denom_value"])
         found_dict["denom_unit"].append(token_dict["denom_unit"])
         if (
@@ -2209,7 +2004,7 @@ class MaxDosePerPeriodElement(BaseElement):
         ):
             found_dict["denom_value"][-1] = "1"
         formatted_phrase = (
-            f"up to a maximum of {found_dict['num_value'][-1]} {found_dict['num_unit'][-1]} "
+            f"up to a maximum of {num_value} {num_unit} "
             f"in {found_dict['denom_value'][-1]} {found_dict['denom_unit'][-1]}"
         )
         return formatted_phrase, found_dict
@@ -2247,16 +2042,12 @@ class MaxDosePerAdministrationElement(BaseElement):
                 {"LOWER": {"IN": ["max", "maximum"]}},
                 {"LOWER": "of"},
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
                 {"LOWER": "per"},
                 {"LOWER": "dose"},
             ]
         )
-        """
-        Captures:
-            up to a maximum of 5 sprays per dose
-            up to a max of 5 sprays per dose
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 5,
@@ -2271,16 +2062,12 @@ class MaxDosePerAdministrationElement(BaseElement):
                 {"LOWER": "more"},
                 {"LOWER": "than"},
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
                 {"LOWER": "per"},
                 {"LOWER": "dose"},
             ]
         )
-        """
-        Captures:
-            no more than 5 sprays per dose
-            not more than 5 sprays per dose
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 3,
@@ -2288,9 +2075,11 @@ class MaxDosePerAdministrationElement(BaseElement):
         }
 
     def phrase_parts(self, span, found_dict, token_dict):
-        found_dict["value"].append(token_dict["value"])
-        found_dict["unit"].append(token_dict["unit"])
-        formatted_phrase = f"up to a maximum of {found_dict['value'][-1]} {found_dict['unit'][-1]} per dose"
+        value = token_dict["value"]
+        unit = _resolve_parenthetical_s(token_dict["unit"], value)
+        found_dict["value"].append(value)
+        found_dict["unit"].append(unit)
+        formatted_phrase = f"up to a maximum of {value} {unit} per dose"
         return formatted_phrase, found_dict
 
 
@@ -2326,7 +2115,7 @@ class MaxDosePerLifetimeElement(BaseElement):
                 {"LOWER": {"IN": ["max", "maximum"]}},
                 {"LOWER": "of"},
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
                 {"LOWER": {"IN": ["in", "per", "for"]}},
                 {"LOWER": {"IN": ["the"]}, "OP": "?"},
                 {"LOWER": "lifetime"},
@@ -2335,12 +2124,7 @@ class MaxDosePerLifetimeElement(BaseElement):
                 {"LOWER": "patient", "OP": "?"},
             ]
         )
-        """
-        Captures:
-            up to a maximum of 5 sprays per lifetime of the patient
-            up to a max of 5 sprays for the lifetime of patient
-            up to a maximum of 5 sprays in the lifetime of the patient
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 5,
@@ -2354,7 +2138,7 @@ class MaxDosePerLifetimeElement(BaseElement):
                 {"LOWER": {"IN": ["max", "maximum"]}},
                 {"LOWER": "of"},
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
                 {"LOWER": {"IN": ["in", "per", "for"]}},
                 {"LOWER": {"IN": ["the"]}, "OP": "?"},
                 {"LOWER": "lifetime"},
@@ -2368,12 +2152,7 @@ class MaxDosePerLifetimeElement(BaseElement):
             "value": 2,
             "unit": 3,
         }
-        """
-        Captures:
-            maximum of 5 sprays per lifetime of the patient
-            max of 5 sprays for the lifetime of patient
-            maximum of 5 sprays in the lifetime of the patient
-        """
+        # See to_test.py element_specific for capture/ignore examples
         pattern_name = "pattern3"
         self.meta_creator(pattern_name)
         self.pattern = []
@@ -2383,7 +2162,7 @@ class MaxDosePerLifetimeElement(BaseElement):
                 {"LOWER": "more"},
                 {"LOWER": "than"},
                 {"TEXT": {"REGEX": "^[0-9]+(\\.5|\\.25)?$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
                 {"LOWER": {"IN": ["in", "per", "for"]}},
                 {"LOWER": {"IN": ["the"]}, "OP": "?"},
                 {"LOWER": "lifetime"},
@@ -2392,11 +2171,7 @@ class MaxDosePerLifetimeElement(BaseElement):
                 {"LOWER": "patient", "OP": "?"},
             ]
         )
-        """
-        Captures:
-            not more than 5 sprays per lifetime of the patient
-            no more than 5 sprays for the lifetime of patient
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 3,
@@ -2404,11 +2179,12 @@ class MaxDosePerLifetimeElement(BaseElement):
         }
 
     def phrase_parts(self, span, found_dict, token_dict):
-        found_dict["value"].append(token_dict["value"])
-        found_dict["unit"].append(token_dict["unit"])
+        value = token_dict["value"]
+        unit = _resolve_parenthetical_s(token_dict["unit"], value)
+        found_dict["value"].append(value)
+        found_dict["unit"].append(unit)
         formatted_phrase = (
-            f"up to a maximum of {found_dict['value'][-1]} {found_dict['unit'][-1]} "
-            f"for the lifetime of patient"
+            f"up to a maximum of {value} {unit} for the lifetime of patient"
         )
         return formatted_phrase, found_dict
 
@@ -2427,8 +2203,6 @@ class BoundsDurationElement(BaseElement):
         "high",
         "low_unit",
         "high_unit",
-        "start",
-        "end",
     ]
 
     def __init__(self, nlp, matcher):
@@ -2437,7 +2211,9 @@ class BoundsDurationElement(BaseElement):
         self.define_pattern()
 
     def define_options(self):
-        self.options = myconstants.period_unit_config["options"]
+        self.options = [
+            u for u in myconstants.period_unit_config["options"] if u not in ("minute",)
+        ]
         self.prefixes = myconstants.period_unit_config["prefixes"]
         self.suffixes = myconstants.period_unit_config["suffixes"]
 
@@ -2450,14 +2226,10 @@ class BoundsDurationElement(BaseElement):
             [
                 {"LOWER": "for"},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            for 5 days
-            for 3 weeks
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 1,
@@ -2472,13 +2244,10 @@ class BoundsDurationElement(BaseElement):
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
                 {"LOWER": {"IN": ["to", "-", "or"]}},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            for 1 to 3 months
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "low": 1,
@@ -2494,13 +2263,10 @@ class BoundsDurationElement(BaseElement):
                 {"LOWER": "at"},
                 {"LOWER": "least"},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            for at least 4 hours
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "low": 3,
@@ -2515,13 +2281,10 @@ class BoundsDurationElement(BaseElement):
                 {"LOWER": "up"},
                 {"LOWER": "to"},
                 {"TEXT": {"REGEX": "^[0-9]+$"}},
-                {"LEMMA": {"IN": self.options}},
+                {"NORM": {"IN": self.options}},
             ]
         )
-        """
-        Captures:
-            for up to 5 days
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "high": 3,
@@ -2552,15 +2315,16 @@ class BoundsDurationElement(BaseElement):
             raise AssertionError(
                 f"pattern_name: {pattern_name} is not accounted for in this section"
             )
-        found_dict["start"].append(token_dict["start"])
-        found_dict["end"].append(token_dict["end"])
         return formatted_phrase, found_dict
 
 
 class BoundsPeriodElement(BaseElement):
     """
-    Please see the base class for explanations of the steps and contents of the classes. The layout, functions and
-    attributes are similar across all child classes.
+    Matches date ranges like "from 01.01.2025 to 31.12.2025".
+
+    Dates must arrive as SINGLE tokens for the TEXT regex to match. This relies
+    on preprocessing normalising "/" and "-" separators to "." before spaCy
+    tokenises the text. See docs/preprocessing_dates.md for details.
     """
 
     element_key = "boundsPeriod"
@@ -2589,11 +2353,7 @@ class BoundsPeriodElement(BaseElement):
                 {"TEXT": {"REGEX": f"{myconstants.date_reg_dmy}"}},
             ]
         )
-        """
-        Captures:
-            from 2/12/24 to 04/12/24
-            from 30-09-2023 to 1-4-1998
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.pattern.append(
             [
                 {"LOWER": "from"},
@@ -2602,11 +2362,7 @@ class BoundsPeriodElement(BaseElement):
                 {"TEXT": {"REGEX": f"{myconstants.date_reg_ymd}"}},
             ]
         )
-        """
-        Captures:
-            from 24/12/2 to 24/12/04
-            from 2023-30-09 to 1998-1-4
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "start": 1,
@@ -2622,8 +2378,11 @@ class BoundsPeriodElement(BaseElement):
 
 class BoundsAPeriodStartEndElement(BaseElement):
     """
-    Please see the base class for explanations of the steps and contents of the classes. The layout, functions and
-    attributes are similar across all child classes.
+    Matches single-ended date bounds: "from 01.01.2025" or "until 31.12.2025".
+
+    Dates must arrive as SINGLE tokens for the TEXT regex to match. This relies
+    on preprocessing normalising "/" and "-" separators to "." before spaCy
+    tokenises the text. See docs/preprocessing_dates.md for details.
     """
 
     element_key = "boundsAPeriodStartEnd"
@@ -2650,27 +2409,14 @@ class BoundsAPeriodStartEndElement(BaseElement):
                 {"TEXT": {"REGEX": f"{myconstants.date_reg_dmy}"}},
             ]
         )
-        """
-        Captures:
-            from 2/12/24
-            from 04/12/24
-            from 30-09-2023
-            from 1-4-1998
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.pattern.append(
             [
                 {"LOWER": "from"},
                 {"TEXT": {"REGEX": f"{myconstants.date_reg_ymd}"}},
             ]
         )
-        """
-        Captures:
-            from 24/12/24
-            from 24/12/10
-            from 2023-09-23
-            not from 2024-4-65
-            not from 1823/9/9
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "start": 1,
@@ -2684,24 +2430,14 @@ class BoundsAPeriodStartEndElement(BaseElement):
                 {"TEXT": {"REGEX": f"{myconstants.date_reg_dmy}"}},
             ]
         )
-        """
-        Captures:
-            until 4/12/24
-            until 04/12/2010
-            until 21-09-2009
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.pattern.append(
             [
                 {"LOWER": "until"},
                 {"TEXT": {"REGEX": f"{myconstants.date_reg_ymd}"}},
             ]
         )
-        """
-        Captures:
-            until 24/12/24
-            until 24/12/10
-            until 2023-09-23
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "end": 1,
@@ -2724,8 +2460,11 @@ class BoundsAPeriodStartEndElement(BaseElement):
 
 class EventElement(BaseElement):
     """
-    Please see the base class for explanations of the steps and contents of the classes. The layout, functions and
-    attributes are similar across all child classes.
+    Matches specific dates: "on 01.01.2025".
+
+    Dates must arrive as SINGLE tokens for the TEXT regex to match. This relies
+    on preprocessing normalising "/" and "-" separators to "." before spaCy
+    tokenises the text. See docs/preprocessing_dates.md for details.
     """
 
     element_key = "event"
@@ -2752,24 +2491,14 @@ class EventElement(BaseElement):
                 {"TEXT": {"REGEX": f"{myconstants.date_reg_dmy}"}},
             ]
         )
-        """
-        Captures:
-            on 14/12/24
-            on 04/12/10
-            on 23-09-2023
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.pattern.append(
             [
                 {"LOWER": "on"},
                 {"TEXT": {"REGEX": f"{myconstants.date_reg_ymd}"}},
             ]
         )
-        """
-        Captures:
-            on 24/12/24
-            on 24/12/10
-            on 2023-09-23
-        """
+        # See to_test.py element_specific for capture/ignore examples
         self.matcher.add(f"{self.element_key}_{pattern_name}", self.pattern)
         self.metadata[f"{self.element_key}_{pattern_name}"] = {
             "value": 1,
@@ -2796,7 +2525,7 @@ class AsNeededCodeableConceptElement(BaseElement):
         self.define_pattern()
 
     def define_options(self):
-        self.options = myconstants.for_config["options"]
+        self.options = myconstants.for_config
 
     def define_pattern(self):
         self.metadata = {}
@@ -2816,49 +2545,49 @@ class AsNeededCodeableConceptElement(BaseElement):
         )
 
         self.register_patterns_with_multiword(
-            "pattern2",
+            "pattern3",
             [{"LOWER": "as"}, {"LOWER": "necessary"}],
             self.options,
             metadata={"value": [0, None]},
         )
 
         self.register_patterns_with_multiword(
-            "pattern2",
+            "pattern4",
             [{"LOWER": "when"}, {"LOWER": "needed"}],
             self.options,
             metadata={"value": [0, None]},
         )
 
         self.register_patterns_with_multiword(
-            "pattern2",
+            "pattern5",
             [{"LOWER": "when"}, {"LOWER": "required"}],
             self.options,
             metadata={"value": [0, None]},
         )
 
         self.register_patterns_with_multiword(
-            "pattern2",
+            "pattern6",
             [{"LOWER": "when"}, {"LOWER": "necessary"}],
             self.options,
             metadata={"value": [0, None]},
         )
 
         self.register_patterns_with_multiword(
-            "pattern2",
+            "pattern7",
             [{"LOWER": "if"}, {"LOWER": "needed"}],
             self.options,
             metadata={"value": [0, None]},
         )
 
         self.register_patterns_with_multiword(
-            "pattern2",
+            "pattern8",
             [{"LOWER": "if"}, {"LOWER": "required"}],
             self.options,
             metadata={"value": [0, None]},
         )
 
         self.register_patterns_with_multiword(
-            "pattern2",
+            "pattern9",
             [{"LOWER": "if"}, {"LOWER": "necessary"}],
             self.options,
             metadata={"value": [0, None]},
@@ -2885,7 +2614,7 @@ class ForElement(BaseElement):
         self.define_pattern()
 
     def define_options(self):
-        self.options = myconstants.for_config["options"]
+        self.options = myconstants.for_config
 
     def define_pattern(self):
         self.metadata = {}
@@ -2917,10 +2646,10 @@ class POSTagging(BaseElement):
         self.define_pattern()
 
     def define_options(self):
-        self.options = myconstants.for_config["options"]
-        self.prefixes = myconstants.for_config["prefixes"]
-        self.next_prefix = myconstants.for_config["next_prefix"]
-        self.suffixes = myconstants.for_config["suffixes"]
+        self.options = myconstants.for_config
+        self.prefixes = [""]
+        self.next_prefix = [""]
+        self.suffixes = [""]
 
     def define_pattern(self):
         self.metadata = {}
@@ -2928,7 +2657,7 @@ class POSTagging(BaseElement):
         pattern_name = "pattern1"
         self.meta_creator(pattern_name)
         self.pattern = []
-        self.pattern.append(  # Qcall2 - what date formats accepted? mentions 2025-05-03 and 29/12/2025 in link
+        self.pattern.append(
             [
                 {"POS": "ADV", "OP": "*"},
             ]
@@ -2981,24 +2710,48 @@ def build_extraction_schema(element_classes):
     return StructType(fields)
 
 
-def _extract_single_row(text, instances, instances_by_key, priority_map, nlp, matcher):
+DASHABLE_GROUP = frozenset(
+    {
+        "frequencyBare",
+        "dose_QuantityValueAndMaxOnly",
+        "doseRange",
+        "doseXMilliValueOnly",
+        "milligramMax",
+        "whenBare",
+        "doseQuantity",
+        "count",
+    }
+)
+DASH_AT_START_RE = _re.compile(r"^\s*\d+\s*-\s*\d+")
+
+
+def _is_dashed_instance(elem_key: str, span_text: str) -> bool:
+    """
+    Return True when this element should be emitted as *{elem_key}Dashed* in
+    dosage_elements, i.e. when it is one of the allowed dashable element types
+    and its matched text begins with a numeric dash range.
+    """
+    return elem_key in DASHABLE_GROUP and DASH_AT_START_RE.match(span_text) is not None
+
+
+def _extract_single_row(text, elements, elements_by_key, priority_map, nlp, matcher):
     """
     Extract all elements from a single text string in one spaCy pass.
 
     Steps:
-      1. Tokenize text and run all Matcher patterns at once
-      2. Map each match back to its owning element class
-      3. Resolve overlapping spans (higher-priority class wins)
-      4. For each winning match, call the class's phrase_parts() to get structured output
+      1. Tokenise text and run all Matcher patterns at once
+      2. Map each match back to its owning element extractor
+      3. Resolve overlapping spans (higher-priority element wins)
+      4. For each winning match, call the element's phrase_parts() to get structured output
       5. Build the remainder string with *elementKey* markers
     """
     # Pre-fill with None so every column exists even if nothing matches
     empty = {"dosage_elements": text}
-    for inst in instances:
-        empty[f"{inst.element_key}_clean"] = None
-        empty[f"{inst.element_key}_captured"] = None
-        for split_field in inst.element_split:
-            empty[f"{inst.element_key}_{split_field}"] = []
+    for element in elements:
+        empty[f"{element.element_key}_clean"] = None
+        empty[f"{element.element_key}_captured"] = None
+        for split_field in element.element_split:
+            empty[f"{element.element_key}_{split_field}"] = []
 
     if not text or not text.strip():
         return empty
@@ -3008,20 +2761,20 @@ def _extract_single_row(text, instances, instances_by_key, priority_map, nlp, ma
     matches = matcher(doc)
 
     # --- Step 2: Identify which element class each match belongs to ---
-    # The Matcher returns ALL matches from ALL classes. We group them by checking
+    # The Matcher returns ALL matches from ALL element types. We group them by checking
     # which element_key the match label starts with (labels are "{element_key}_{pattern_name}")
     candidates = []
     for match_id, start, end in matches:
         label = doc.vocab.strings[match_id]
-        for inst in instances:
-            if label.startswith(f"{inst.element_key}_"):
-                candidates.append((inst.element_key, label, start, end))
+        for element in elements:
+            if label.startswith(f"{element.element_key}_"):
+                candidates.append((element.element_key, label, start, end))
                 break
 
     # --- Step 3: Resolve overlapping spans ---
-    # Sort by priority first (position in `classes` list — lower index = higher priority),
+    # Sort by priority first (position in `element_types` list — lower index = higher priority),
     # then by span start position, then prefer longest span (negative length).
-    # This ensures higher-priority classes claim their spans before lower-priority ones,
+    # This ensures higher-priority element types claim their spans before lower-priority ones,
     # and for the same element at the same position, the longest match wins.
     candidates.sort(key=lambda m: (priority_map[m[0]], m[2], -(m[3] - m[2])))
 
@@ -3037,6 +2790,40 @@ def _extract_single_row(text, instances, instances_by_key, priority_map, nlp, ma
             continue
         taken_ranges.append((start, end))
         resolved[elem_key] = (label, start, end)
+
+    # Post-resolution rescue: if methodDirect claimed a dual-purpose word (spray/suck)
+    # that also appears as a unit in a doseQuantity candidate immediately after a number,
+    # prefer doseQuantity (the longer, more informative span).  Rule 2 (singular/plural
+    # mismatch) will then catch badly-written cases like "5 spray per day" (qty=5 + singular).
+    _DUAL_METHOD_UNIT_WORDS = {"spray", "suck"}
+    if "methodDirect" in resolved:
+        md_label, md_start, md_end = resolved["methodDirect"]
+        method_text = doc[md_start:md_end].text.lower().lstrip("to ")
+        if method_text in _DUAL_METHOD_UNIT_WORDS:
+            for _ek, _lbl, _s, _e in candidates:
+                if (
+                    _ek == "doseQuantity"
+                    and _e == md_end
+                    and _s < md_start
+                    and doc[_s].like_num
+                ):
+                    # Drop method, drop orphaned dose_QuantityValueOnly, claim doseQuantity
+                    taken_ranges = [
+                        (s, e) for s, e in taken_ranges if (s, e) != (md_start, md_end)
+                    ]
+                    del resolved["methodDirect"]
+                    if "dose_QuantityValueOnly" in resolved:
+                        qvo_s, qvo_e = (
+                            resolved["dose_QuantityValueOnly"][1],
+                            resolved["dose_QuantityValueOnly"][2],
+                        )
+                        taken_ranges = [
+                            (s, e) for s, e in taken_ranges if (s, e) != (qvo_s, qvo_e)
+                        ]
+                        del resolved["dose_QuantityValueOnly"]
+                    taken_ranges.append((_s, _e))
+                    resolved["doseQuantity"] = (_lbl, _s, _e)
+                    break
 
     # Post-resolution: if methodDirect is captured and a "WithMethod" element was
     # blocked by methodPassive, prefer the longer WithMethod span (which subsumes
@@ -3054,6 +2841,24 @@ def _extract_single_row(text, instances, instances_by_key, priority_map, nlp, ma
                     del resolved["methodPassive"]
                     taken_ranges.append((start, end))
                     resolved[with_method_key] = (label, start, end)
+                    # Remove any already-resolved element whose span is fully subsumed
+                    # by the newly promoted WithMethod span. This prevents e.g.
+                    # frequencyBare being retained when frequencyWithMethod is promoted
+                    # to cover the same tokens — the bare element won its span before
+                    # the rescue ran so normal overlap detection didn't catch it.
+                    subsumed = [
+                        k
+                        for k, (_, s, e) in list(resolved.items())
+                        if k != with_method_key and s >= start and e <= end
+                    ]
+                    for k in subsumed:
+                        sub_s, sub_e = resolved[k][1], resolved[k][2]
+                        resolved.pop(k)
+                        taken_ranges = [
+                            (s, e)
+                            for s, e in taken_ranges
+                            if not (s == sub_s and e == sub_e)
+                        ]
                     break
             if "methodPassive" not in resolved:
                 break
@@ -3062,15 +2867,15 @@ def _extract_single_row(text, instances, instances_by_key, priority_map, nlp, ma
     result = dict(empty)
 
     for elem_key, (label, start, end) in resolved.items():
-        inst = instances_by_key[elem_key]
+        element = elements_by_key[elem_key]
         span = doc[start:end]
 
         # Build token_dict exactly as extract_element_using_matcher() does:
         # uses metadata positions to pull out the important tokens from the span
         token_dict = {}
-        for key in inst.element_split:
+        for key in element.element_split:
             token_dict[key] = ""
-        for key, position in inst.metadata[label].items():
+        for key, position in element.metadata[label].items():
             if isinstance(position, list):
                 sliced = span[position[0] : position[1]]
                 token_dict[key] = sliced.text
@@ -3081,14 +2886,16 @@ def _extract_single_row(text, instances, instances_by_key, priority_map, nlp, ma
         token_dict["pattern_name"] = label.replace(f"{elem_key}_", "")
 
         # phrase_parts() formats the output string and populates found_dict
-        found_dict = {var: [] for var in inst.element_split}
-        formatted_phrase, found_dict = inst.phrase_parts(span, found_dict, token_dict)
+        found_dict = {var: [] for var in element.element_split}
+        formatted_phrase, found_dict = element.phrase_parts(
+            span, found_dict, token_dict
+        )
         if formatted_phrase is None:
             continue
 
         result[f"{elem_key}_clean"] = formatted_phrase
         result[f"{elem_key}_captured"] = span.text
-        for split_field in inst.element_split:
+        for split_field in element.element_split:
             result[f"{elem_key}_{split_field}"] = (
                 found_dict[split_field] if found_dict[split_field] else []
             )
@@ -3096,13 +2903,22 @@ def _extract_single_row(text, instances, instances_by_key, priority_map, nlp, ma
     # --- Step 5: Build remainder string with *elementKey* markers ---
     # Use character-level positions (doc[token].idx) for accurate replacement,
     # rather than str.replace() which could match the wrong occurrence of duplicate text.
+
     replacements = []
     for elem_key, (label, start, end) in resolved.items():
         if result.get(f"{elem_key}_clean") is None:
             continue
+
+        span = doc[start:end]
+        emitted_key = (
+            f"{elem_key}Dashed"
+            if _is_dashed_instance(elem_key, span.text)
+            else elem_key
+        )
+
         char_start = doc[start].idx
         char_end = doc[end - 1].idx + len(doc[end - 1])
-        replacements.append((char_start, char_end, f"*{elem_key}*"))
+        replacements.append((char_start, char_end, f"*{emitted_key}*"))
 
     # Replace from end-to-start so earlier positions aren't shifted by insertions
     replacements.sort(key=lambda r: r[0], reverse=True)
@@ -3115,31 +2931,54 @@ def _extract_single_row(text, instances, instances_by_key, priority_map, nlp, ma
     return result
 
 
-def create_extract_all_udf(instances, bc_nlp, bc_matcher):
+def create_extract_all_udf(elements, bc_nlp, bc_matcher):
     """
     Create a pandas_udf that extracts all elements in a single spaCy/Matcher pass.
 
-    This replaces the loop `for instance in instances: instance.update_df(...)` with one
-    UDF call. The pandas_udf processes rows in vectorized batches, reducing JVM<->Python
-    serialization overhead compared to ~30 separate standard UDFs.
+    Overview
+    --------
+    Each dosage string (e.g. "take 2 tablets 3 times a day") needs to be parsed
+    into structured fields (dose quantity, frequency, method, etc.). Rather than
+    running ~30 separate UDFs — one per element type — this function creates a
+    **single** ``pandas_udf`` that does everything in one call:
+
+    1. **spaCy tokenises** the text once.
+    2. The **Matcher** runs all ~30 element patterns simultaneously, returning
+       every match in one pass.
+    3. ``_extract_single_row()`` resolves overlapping matches (higher-priority
+       element wins), then calls each element's ``phrase_parts()`` to produce
+       the structured output (``_clean``, ``_captured``, and sub-field arrays).
+    4. The UDF returns a struct column containing all element fields, which the
+       caller unpacks into individual DataFrame columns.
+
+    Using a ``pandas_udf`` means Spark sends rows in **vectorised batches**
+    (Arrow-serialised chunks) rather than one-at-a-time, significantly reducing
+    JVM ↔ Python serialisation overhead.
+
+    The ``bc_nlp`` and ``bc_matcher`` broadcast variables ensure the large spaCy
+    model and compiled Matcher are sent to each executor **once**, not copied
+    per-row or per-partition.
 
     Parameters
     ----------
-    instances : list
-        Initialized element class instances (in priority order).
-    bc_nlp : Broadcast
-        Broadcast spaCy nlp pipeline.
-    bc_matcher : Broadcast
-        Broadcast spaCy Matcher (with all patterns registered).
+    elements : list[BaseElement]
+        Initialised element extractor objects (in priority order — lower index
+        wins when two elements match the same tokens).
+    bc_nlp : pyspark.Broadcast
+        Broadcast spaCy ``nlp`` pipeline (tokenizer + lemmatizer + norm_from_lemma).
+    bc_matcher : pyspark.Broadcast
+        Broadcast spaCy ``Matcher`` with all element patterns registered.
 
     Returns
     -------
-    tuple of (pandas_udf function, StructType schema)
+    pandas_udf
+        A Spark UDF that accepts a string column and returns a struct column
+        with all element fields (schema derived from ``element_types``).
     """
-    schema = build_extraction_schema(classes)
-    # Priority = position in the classes list (lower index = higher priority = wins overlaps)
-    priority_map = {inst.element_key: idx for idx, inst in enumerate(instances)}
-    instances_by_key = {inst.element_key: inst for inst in instances}
+    schema = build_extraction_schema(element_types)
+    # Priority = position in element_types list (lower index = higher priority = wins overlaps)
+    priority_map = {elem.element_key: idx for idx, elem in enumerate(elements)}
+    elements_by_key = {elem.element_key: elem for elem in elements}
 
     array_columns = [f.name for f in schema.fields if isinstance(f.dataType, ArrayType)]
 
@@ -3150,7 +2989,7 @@ def create_extract_all_udf(instances, bc_nlp, bc_matcher):
         matcher = bc_matcher.value
         rows = [
             _extract_single_row(
-                text, instances, instances_by_key, priority_map, nlp, matcher
+                text, elements, elements_by_key, priority_map, nlp, matcher
             )
             for text in texts
         ]
@@ -3159,10 +2998,17 @@ def create_extract_all_udf(instances, bc_nlp, bc_matcher):
             df[col] = df[col].apply(lambda x: x if isinstance(x, list) else [])
         return df
 
-    return extract_all_udf, schema
+    return extract_all_udf
 
 
-classes = [
+# ---------------------------------------------------------------------------
+# Element types — ordered list of all element extractor classes.
+#
+# Order matters: earlier entries have higher priority and win when two
+# element types match the same tokens. See _extract_single_row() for the
+# overlap resolution logic.
+# ---------------------------------------------------------------------------
+element_types = [
     MethodDirectElement,
     MethodPassiveElement,
     RateRatioElement,
@@ -3184,8 +3030,6 @@ classes = [
     BoundsPeriodElement,
     BoundsAPeriodStartEndElement,
     EventElement,
-    AsNeededCodeableConceptElement,
-    ForElement,
     CountElement,
     DoseRangeElement,
     DoseQuantityElement,
@@ -3204,11 +3048,11 @@ classes = [
 # 1 QOnly
 
 # ---------------------------------------------------------------------------
-# Full Lookup Schema (generated from the classes list)
+# Full Lookup Schema (generated from the element_types list)
 # ---------------------------------------------------------------------------
 # This is the complete output schema for the lookup table. It's built by iterating
-# the classes list and reading their element_key/element_split class attributes,
-# so it automatically stays in sync when you add/remove/rename element classes.
+# element_types and reading their element_key/element_split class attributes,
+# so it automatically stays in sync when you add/remove/rename element types.
 
 
 def _build_lookup_schema():
@@ -3222,14 +3066,18 @@ def _build_lookup_schema():
         StructField("extras_b_clean", StringType(), True),
     ]
 
-    # --- Element columns (derived from classes list) ---
-    for cls in classes:
-        fields.append(StructField(f"{cls.element_key}_clean", StringType(), True))
-        fields.append(StructField(f"{cls.element_key}_captured", StringType(), True))
-        for split_field in cls.element_split:
+    # --- Element columns (derived from element_types list) ---
+    for element_type in element_types:
+        fields.append(
+            StructField(f"{element_type.element_key}_clean", StringType(), True)
+        )
+        fields.append(
+            StructField(f"{element_type.element_key}_captured", StringType(), True)
+        )
+        for split_field in element_type.element_split:
             fields.append(
                 StructField(
-                    f"{cls.element_key}_{split_field}",
+                    f"{element_type.element_key}_{split_field}",
                     ArrayType(StringType(), True),
                     True,
                 )

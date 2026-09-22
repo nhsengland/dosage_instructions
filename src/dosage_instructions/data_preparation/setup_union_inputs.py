@@ -1,6 +1,6 @@
 from transforms.api import transform_df, Input, Output
 
-from pyspark.sql.functions import lit
+from pyspark.sql import functions as F
 from pyspark.sql import DataFrame
 
 
@@ -12,6 +12,6 @@ from pyspark.sql import DataFrame
     test40_input=Input("ri.foundry.main.dataset.f8da5b11-c101-4b2c-ba11-e9619cbf000e"),
 )
 def compute(full_real_input: DataFrame, test40_input: DataFrame) -> DataFrame:
-    full_real_input = full_real_input.withColumn("is_test", lit(False))
-    test40_input = test40_input.withColumn("is_test", lit(True))
+    full_real_input = full_real_input.withColumn("is_test", F.lit(False))
+    test40_input = test40_input.withColumn("is_test", F.lit(True))
     return test40_input.unionByName(full_real_input)

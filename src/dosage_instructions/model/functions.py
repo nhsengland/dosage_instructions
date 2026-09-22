@@ -1,16 +1,9 @@
 import re
 
 from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 from pyspark.sql.types import StringType
-from pyspark.sql.functions import (
-    regexp_extract,
-    udf,
-    col as col_,
-)
-
-from dosage_instructions.model.constants import (
-    number_dict_options,
-)
+from pyspark.sql.window import Window
 
 
 def remove_first_match(text: str, pattern: str, element_key: str) -> str:
@@ -32,29 +25,22 @@ def reg_extract_and_tag_element(
     in the original string with '*element_name*' for identification.
     """
 
-    pattern = "|".join(col_options)
+    # Sort longest-first so more-specific patterns win over shorter substrings.
+    # e.g. "for blood pressure control" must beat "for blood pressure",
+    # "for your mood and sleep" must beat "for your mood".
+    pattern = "|".join(sorted(col_options, key=len, reverse=True))
     element_key = new_col_name.removesuffix("_clean")
 
     # Define udf
-    remove_first_match_udf = udf(
+    remove_first_match_udf = F.udf(
         lambda text: remove_first_match(text, pattern, element_key), StringType()
     )
 
     df = df.withColumn(
-        new_col_name, regexp_extract(dosage_col_name, pattern, 0)
+        new_col_name, F.regexp_extract(dosage_col_name, pattern, 0)
     ).withColumn(dosage_col_name, remove_first_match_udf(df[dosage_col_name]))
+
     return df
-
-
-def convert_digits_to_words(text: str) -> str:
-    """
-    Converts digits 1-10 to words. As an option - may not be used.
-    """
-    return re.sub(
-        r"\d",
-        lambda x: " " + number_dict_options["digit_to_word"][x.group()] + " ",
-        text,
-    )
 
 
 def get_all_combinations(
@@ -103,6 +89,28 @@ def get_all_combinations(
     ]
 
     return combination_dict, combination_list
+
+
+def apply_row_selection(df: DataFrame, min_count: int | None) -> DataFrame:
+    """
+    Apply optional row-selection filter to a grouped dosage DataFrame.
+
+    Uses a window partition by dosage_lower: computes max(dosage_count) per group
+    and keeps only groups whose max meets the min_count threshold.
+
+    Parameters
+    ----------
+    min_count : int or None
+        Keep only dosage_lower groups whose max(dosage_count) >= this value.
+        Set to None to disable filtering.
+    """
+    if min_count is not None:
+        w = Window.partitionBy("dosage_lower")
+        df = df.withColumn("_max_dosage_count", F.max("dosage_count").over(w))
+        df = df.filter(F.col("_max_dosage_count") >= min_count)
+        df = df.drop("_max_dosage_count")
+
+    return df
 
 
 """

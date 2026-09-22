@@ -12,6 +12,29 @@ def nlp():
     infixes = _nlp.Defaults.infixes + [r"\/", r"\-", r"(?<=[0-9])(?=[a-zA-Z])"]
     infix_regex = compile_infix_regex(infixes)
     _nlp.tokenizer.infix_finditer = infix_regex.finditer
+
+    # Register "(s)" forms as single tokens (mirrors matcher_run.py setup)
+    from dosage_instructions.model.constants import PARENTHETICAL_S_WORDS
+
+    for word in PARENTHETICAL_S_WORDS:
+        _nlp.tokenizer.add_special_case(
+            f"{word}(s)", [{"ORTH": f"{word}(s)", "NORM": word}]
+        )
+
+    # Copy lemma → norm so matcher patterns can use NORM uniformly.
+    # Overwrite for all tokens EXCEPT special-case "(s)" forms (detected by "(" in text)
+    # to undo spaCy's American-English normalisation (e.g. "litres" norm="liters" → "litre").
+    from spacy.language import Language
+
+    @Language.component("norm_from_lemma")
+    def norm_from_lemma(doc):
+        for token in doc:
+            if "(" not in token.text:
+                token.norm_ = token.lemma_
+        return doc
+
+    _nlp.add_pipe("norm_from_lemma", after="lemmatizer")
+
     return _nlp
 
 
@@ -24,9 +47,9 @@ def matcher(nlp):
 @pytest.fixture(scope="session")
 def all_instances(nlp, matcher):
     """Instantiate all element classes, registering patterns in the matcher."""
-    from dosage_instructions.model.matcher_classes import classes
+    from dosage_instructions.model.matcher_classes import element_types
 
-    return [cls(nlp, matcher) for cls in classes]
+    return [element_type(nlp, matcher) for element_type in element_types]
 
 
 @pytest.fixture(scope="session")

@@ -1,40 +1,7 @@
-import re
-
 from pyspark.sql import DataFrame
-from pyspark.sql.types import StringType
-from pyspark.sql.functions import (
-    lower,
-    trim,
-    regexp_replace,
-    when,
-    udf,
-    lit,
-    col as col_,
-)
+from pyspark.sql import functions as F
 
-from dosage_instructions.model.constants import (
-    number_dict_options,
-    latin_dict,
-    preprocess_units_of_measure,
-    exclude_list,
-    replace_isolated_terms,
-    replace_partofaword_terms,
-    weird_terms,
-)
-
-
-def convert_words_to_digits(text: str) -> str:
-    """
-    Converts words from 1-10 to digits. Using this in initial preprocessing so that
-    numbers can be picked up in the model using regex's \\d and [0-9].
-    """
-
-    result = re.sub(
-        r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten)+\b",
-        lambda x: " " + number_dict_options["word_to_digit"][x.group()] + " ",
-        text,
-    )
-    return re.sub(r" {2,}", " ", result).strip()
+import dosage_instructions.model.constants as myconstants
 
 
 def replace_preprocess(
@@ -88,10 +55,10 @@ def replace_preprocess(
                 replace_term = rf"{i}"
 
             df = df.withColumn(
-                col_name, regexp_replace(col_name, replace_term, meaning)
+                col_name, F.regexp_replace(col_name, replace_term, meaning)
             )
 
-    df = df.withColumn(col_name, regexp_replace(col_name, r"\s{2,}", " "))
+    df = df.withColumn(col_name, F.regexp_replace(col_name, r"\s{2,}", " "))
 
     return df
 
@@ -105,10 +72,14 @@ def exclude_rows(exclude_list: list[str], df: DataFrame, col_name: str) -> DataF
     exclude_str = "|".join([f"({item})" for item in exclude_list])
     df = df.withColumn(
         "exclude",
-        when(col_(col_name).rlike(exclude_str), lit("removed")).otherwise(lit(None)),
+        F.when(
+            F.col(col_name).rlike(exclude_str), F.lit("general_fail: removed")
+        ).otherwise(F.lit(None)),
     ).withColumn(
         col_name,
-        when(col_(col_name).rlike(exclude_str), lit("")).otherwise(col_(col_name)),
+        F.when(F.col(col_name).rlike(exclude_str), F.lit("")).otherwise(
+            F.col(col_name)
+        ),
     )
     return df
 
@@ -134,39 +105,55 @@ def preprocess_dosage(df):
             words→digits, units normalised, terms replaced, trimmed).
     """
     dosage_col_name = "dosage_lower"
-    convert_udf = udf(convert_words_to_digits, StringType())
 
-    df = df.withColumn(dosage_col_name, lower(col_("dosage")))
+    df = df.withColumn(dosage_col_name, F.lower(F.col("dosage")))
 
-    latin = add_dots_to_latin(latin_dict)
+    # Normalise whitespace early — trim leading/trailing and collapse internal
+    # tabs/multi-spaces to a single space before any pattern matching begins.
+    df = df.withColumn(dosage_col_name, F.trim(F.col(dosage_col_name)))
+    df = df.withColumn(
+        dosage_col_name, F.regexp_replace(F.col(dosage_col_name), r"[ \t]+", " ")
+    )
+
+    latin = add_dots_to_latin(myconstants.latin_dict)
     df = replace_preprocess(latin, df, dosage_col_name, only_if_isolated=False)
 
-    df = exclude_rows(exclude_list, df, dosage_col_name)
+    df = exclude_rows(myconstants.exclude_list, df, dosage_col_name)
 
-    df = df.withColumn(dosage_col_name, convert_udf(col_(dosage_col_name)))
+    # Convert number words to digits (e.g. "two" → "2") using native Spark
+    # regexp_replace via replace_preprocess — avoids Python UDF serialisation.
+    df = replace_preprocess(myconstants.WORD_TO_DIGIT, df, dosage_col_name)
 
     df = replace_preprocess(
-        preprocess_units_of_measure,
+        myconstants.preprocess_units_of_measure,
         df,
         dosage_col_name,
         replacer_is_key=True,
         only_if_isolated=False,
     )
-    df = replace_preprocess(replace_isolated_terms, df, dosage_col_name)
+    df = replace_preprocess(myconstants.replace_isolated_terms, df, dosage_col_name)
+    # Normalise date separators (/ and - → .) so dates tokenise as single tokens.
+    # See docs/preprocessing_dates.md for full explanation.
     df = replace_preprocess(
-        replace_partofaword_terms, df, dosage_col_name, only_if_isolated=False
+        myconstants.normalise_date_separators,
+        df,
+        dosage_col_name,
+        only_if_isolated=False,
     )
-    df = replace_preprocess(weird_terms, df, dosage_col_name, only_if_isolated=False)
+    df = replace_preprocess(
+        myconstants.normalise_number_ranges, df, dosage_col_name, only_if_isolated=False
+    )
 
-    df = df.withColumn(dosage_col_name, trim(col_(dosage_col_name)))
+    # Tidy up messy punctuation — stray dots and spaces at the start, end, and middle of dosage strings.
+    df = df.withColumn(dosage_col_name, F.trim(F.col(dosage_col_name)))
     df = df.withColumn(
-        dosage_col_name, regexp_replace(col_(dosage_col_name), r"\.+$", "")
+        dosage_col_name, F.regexp_replace(F.col(dosage_col_name), r"\.+$", "")
     )
     df = df.withColumn(
-        dosage_col_name, regexp_replace(col_(dosage_col_name), r"^\.\s*", "")
+        dosage_col_name, F.regexp_replace(F.col(dosage_col_name), r"^\.\s*", "")
     )
     df = df.withColumn(
-        dosage_col_name, regexp_replace(col_(dosage_col_name), r"\.\s*\.", ".")
+        dosage_col_name, F.regexp_replace(F.col(dosage_col_name), r"\.\s*\.", ".")
     )
 
     return df

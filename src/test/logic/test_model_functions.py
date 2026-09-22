@@ -11,11 +11,9 @@ import pytest
 # sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from dosage_instructions.model.functions import (
     remove_first_match,
-    convert_digits_to_words,
     get_all_combinations,
 )
 from dosage_instructions.model.preprocessing import (
-    convert_words_to_digits,
     add_dots_to_latin,
 )
 
@@ -42,49 +40,6 @@ class TestRemoveFirstMatch:
     def test_regex_pattern(self):
         result = remove_first_match("take 2 tablets", r"\d+", "num")
         assert result == "take *num* tablets"
-
-
-# ─── convert_digits_to_words ──────────────────────────────────────────────────
-
-
-class TestConvertDigitsToWords:
-
-    def test_single_digit(self):
-        result = convert_digits_to_words("2")
-        assert "two" in result
-
-    def test_preserves_non_digits(self):
-        result = convert_digits_to_words("take tablets")
-        assert result == "take tablets"
-
-    def test_multiple_digits(self):
-        result = convert_digits_to_words("1 or 2")
-        assert "one" in result
-        assert "two" in result
-
-
-# ─── convert_words_to_digits ──────────────────────────────────────────────────
-
-
-class TestConvertWordsToDigits:
-
-    def test_single_word(self):
-        result = convert_words_to_digits("two")
-        assert "2" in result
-
-    def test_preserves_non_number_words(self):
-        result = convert_words_to_digits("take tablets")
-        assert result == "take tablets"
-
-    def test_multiple_words(self):
-        result = convert_words_to_digits("one or two")
-        assert "1" in result
-        assert "2" in result
-
-    def test_word_boundary_respected(self):
-        # "done" contains "one" but shouldn't be replaced
-        result = convert_words_to_digits("done")
-        assert result == "done"
 
 
 # ─── get_all_combinations ─────────────────────────────────────────────────────

@@ -16,6 +16,8 @@ from dosage_instructions.model.cross_column_validity_rules import (
     rule_cc8_event_with_period_gt_1_day,
     rule_cc9_event_or_count_with_bounds_duration,
     rule_cc10_freq_leq_1_with_multi_per_day_when,
+    rule_cc12_period_without_single_dose,
+    rule_cc13_each_every_when_with_non_day_period,
     evaluate_cross_column_rules,
 )
 
@@ -1258,9 +1260,192 @@ class TestEvaluateCrossColumnRules:
         result = evaluate_cross_column_rules(row)
         assert result is not None
         assert "cross_column_fail:" in result
-        # Rule 1 (fortnight) and rule 2 (singular/plural) should both fire
-        assert "1" in result
-        assert "2" in result
+        # CC1 (fortnight) and CC2 (singular/plural) should both fire
+        assert "CC1" in result
+        assert "CC2" in result
 
     def test_empty_row_passes(self):
         assert evaluate_cross_column_rules({}) is None
+
+
+# ---------------------------------------------------------------------------
+# CC12: periodElement (implied frequency=1) with dose != 1
+# ---------------------------------------------------------------------------
+
+
+class TestCC12PeriodWithoutSingleDose:
+    """CC12: periodElement assumes frequency=1, only valid when dose == 1."""
+
+    def test_pass_dose_quantity_equals_1(self):
+        """1 tablet every day → FINE."""
+        row = {
+            "periodElement_period_units": "day",
+            "periodElement_period": 1,
+            "periodElement_frequency": 1,
+            "doseQuantity_quantity": 1,
+            "doseQuantity_units": "tablet",
+        }
+        assert rule_cc12_period_without_single_dose(row) is None
+
+    def test_pass_value_only_equals_1(self):
+        """'1 every day' (dose_QuantityValueOnly=1) → FINE."""
+        row = {
+            "periodElement_period_units": "day",
+            "periodElement_period": 1,
+            "periodElement_frequency": 1,
+            "dose_QuantityValueOnly_value": 1,
+        }
+        assert rule_cc12_period_without_single_dose(row) is None
+
+    def test_fail_dose_quantity_gt_1(self):
+        """2 tablets every day → EXCLUDE."""
+        row = {
+            "periodElement_period_units": "day",
+            "periodElement_period": 1,
+            "periodElement_frequency": 1,
+            "doseQuantity_quantity": 2,
+            "doseQuantity_units": "tablets",
+        }
+        assert rule_cc12_period_without_single_dose(row) is not None
+
+    def test_fail_value_only_gt_1(self):
+        """'3 every 4 hours' (dose_QuantityValueOnly=3) → EXCLUDE."""
+        row = {
+            "periodElement_period_units": "hours",
+            "periodElement_period": 4,
+            "periodElement_frequency": 1,
+            "dose_QuantityValueOnly_value": 3,
+        }
+        assert rule_cc12_period_without_single_dose(row) is not None
+
+    def test_fail_dose_range(self):
+        """1-2 tablets every day → EXCLUDE (range)."""
+        row = {
+            "periodElement_period_units": "day",
+            "periodElement_period": 1,
+            "periodElement_frequency": 1,
+            "doseRange_low": 1,
+            "doseRange_high": 2,
+        }
+        assert rule_cc12_period_without_single_dose(row) is not None
+
+    def test_fail_value_and_max(self):
+        """dose_QuantityValueAndMaxOnly with period → EXCLUDE."""
+        row = {
+            "periodElement_period_units": "day",
+            "periodElement_period": 1,
+            "periodElement_frequency": 1,
+            "dose_QuantityValueAndMaxOnly_value": 2,
+        }
+        assert rule_cc12_period_without_single_dose(row) is not None
+
+    def test_fail_no_dose(self):
+        """'every day' with no dose at all → EXCLUDE."""
+        row = {
+            "periodElement_period_units": "day",
+            "periodElement_period": 1,
+            "periodElement_frequency": 1,
+        }
+        assert rule_cc12_period_without_single_dose(row) is not None
+
+    def test_skip_when_frequency_bare_present(self):
+        """2 tablets 3 times a day every day — frequencyBare present, rule doesn't apply."""
+        row = {
+            "periodElement_period_units": "day",
+            "periodElement_period": 1,
+            "periodElement_frequency": 1,
+            "frequencyBare_frequency": 3,
+            "frequencyBare_period_unit": "day",
+            "doseQuantity_quantity": 2,
+            "doseQuantity_units": "tablets",
+        }
+        assert rule_cc12_period_without_single_dose(row) is None
+
+    def test_skip_when_no_period_element(self):
+        """No periodElement at all — rule doesn't apply."""
+        row = {
+            "frequencyBare_frequency": 2,
+            "frequencyBare_period_unit": "day",
+            "doseQuantity_quantity": 2,
+            "doseQuantity_units": "tablets",
+        }
+        assert rule_cc12_period_without_single_dose(row) is None
+
+    def test_pass_every_4_weeks_dose_1(self):
+        """1 injection every 4 weeks → FINE."""
+        row = {
+            "periodElement_period_units": "weeks",
+            "periodElement_period": 4,
+            "periodElement_frequency": 1,
+            "doseQuantity_quantity": 1,
+            "doseQuantity_units": "injection",
+        }
+        assert rule_cc12_period_without_single_dose(row) is None
+
+
+# ---------------------------------------------------------------------------
+# CC13: "each/every <time-of-day>" when contradicts non-day period
+# ---------------------------------------------------------------------------
+
+
+class TestCC13EachEveryWhenWithNonDayPeriod:
+    """CC13: each/every morning/night/etc with non-day period → EXCLUDE."""
+
+    def test_fail_each_morning_with_weekly_period(self):
+        """'take 1 every week each morning' → period=week contradicts daily when."""
+        row = {
+            "whenBare_captured": "each morning",
+            "periodElement_period_units": "week",
+            "periodElement_period": "1",
+        }
+        assert rule_cc13_each_every_when_with_non_day_period(row) is not None
+
+    def test_fail_every_night_with_monthly_period(self):
+        """'take 1 every month every night' → period=month contradicts daily when."""
+        row = {
+            "whenBare_captured": "every night",
+            "periodElement_period_units": "month",
+            "periodElement_period": "1",
+        }
+        assert rule_cc13_each_every_when_with_non_day_period(row) is not None
+
+    def test_pass_each_morning_with_day_period(self):
+        """'take 1 a day each morning' → period=day, consistent."""
+        row = {
+            "whenBare_captured": "each morning",
+            "periodElement_period_units": "day",
+            "periodElement_period": "1",
+        }
+        assert rule_cc13_each_every_when_with_non_day_period(row) is None
+
+    def test_pass_each_morning_no_period(self):
+        """'take 1 each morning' → no period (will be inferred as day)."""
+        row = {
+            "whenBare_captured": "each morning",
+        }
+        assert rule_cc13_each_every_when_with_non_day_period(row) is None
+
+    def test_pass_at_night_not_each_every(self):
+        """'take 1 a day at night' → no each/every prefix → rule N/A."""
+        row = {
+            "whenBare_captured": "at night",
+            "periodElement_period_units": "week",
+            "periodElement_period": "1",
+        }
+        assert rule_cc13_each_every_when_with_non_day_period(row) is None
+
+    def test_pass_when_with_method_each_evening_day(self):
+        """whenWithMethod_captured 'each evening' with period=day → FINE."""
+        row = {
+            "whenWithMethod_captured": "each evening",
+            "periodElement_period_units": "day",
+        }
+        assert rule_cc13_each_every_when_with_non_day_period(row) is None
+
+    def test_fail_when_with_method_every_bedtime_weekly(self):
+        """whenWithMethod_captured 'every bedtime' with period=week → EXCLUDE."""
+        row = {
+            "whenWithMethod_captured": "every bedtime",
+            "periodElement_period_units": "week",
+        }
+        assert rule_cc13_each_every_when_with_non_day_period(row) is not None
